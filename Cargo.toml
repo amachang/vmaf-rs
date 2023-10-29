@@ -1,9 +1,18 @@
 [package]
-name = "vmaf-rs"
+name = "vmaf"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libvmaf-sys = { path = "./libvmaf-sys" }
+bitflags = "2.4.0"
+libc = "0.2.149"
+libvmaf-sys = { path = "./libvmaf-sys", features = [] }
+os_str_bytes = "6.5.1"
+y4m = "0.8.0"
+
+[features]
+float = ["libvmaf-sys/float"]
+avx512 = ["libvmaf-sys/avx512"]
+
