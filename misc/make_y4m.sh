@@ -37,11 +37,19 @@ function encode_y4m {
     fi
 }
 
-make_y4m tests/original.y4m 300 320 240
-encode_y4m tests/original.y4m tests/low_quality.y4m 51
-encode_y4m tests/original.y4m tests/high_quality.y4m 10
+make_y4m videos/original.y4m 300 320 240
+encode_y4m videos/original.y4m videos/low_quality.y4m 51
+encode_y4m videos/original.y4m videos/high_quality.y4m 10
 
-make_y4m tests/short_original.y4m 2 160 120
-encode_y4m tests/short_original.y4m tests/short_low_quality.y4m 51
-encode_y4m tests/short_original.y4m tests/short_high_quality.y4m 10
+make_y4m videos/short_original.y4m 2 160 120
+encode_y4m videos/short_original.y4m videos/short_low_quality.y4m 51
+encode_y4m videos/short_original.y4m videos/short_high_quality.y4m 10
+
+# To have files with a meaningless name, for example codes
+if [ ! -f videos/foo.y4m ]; then
+    cp videos/short_original.y4m videos/foo.y4m
+fi
+if [ ! -f videos/bar.y4m ]; then
+    cp videos/short_high_quality.y4m videos/bar.y4m
+fi
 

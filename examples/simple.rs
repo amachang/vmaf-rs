@@ -1,5 +1,5 @@
 fn main() {
-    let score = vmaf::collect_score("tests/original.y4m", "tests/high_quality.y4m", vmaf::CollectScoreOpts::default()).unwrap();
+    let score = vmaf::collect_score("videos/foo.y4m", "videos/bar.y4m", vmaf::CollectScoreOpts::default()).unwrap();
 
     println!("Score: {}", score);
 }

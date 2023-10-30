@@ -25,7 +25,7 @@ pub mod y4m;
 /// use vmaf::*;
 ///
 /// let log_level = LogLevel::Debug;
-/// let score = collect_score("tests/original.y4m", "tests/low_quality.y4m", CollectScoreOpts { log_level, ..Default::default() }).unwrap();
+/// let score = collect_score("videos/foo.y4m", "videos/bar.y4m", CollectScoreOpts { log_level, ..Default::default() }).unwrap();
 ///
 /// print!("Vmaf score: {}", score);
 /// ```
