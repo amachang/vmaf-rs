@@ -1131,7 +1131,7 @@ impl Model {
             .build()?;
 
         let mut ctx = Context::new(cfg)?;
-        ctx.use_simple_model_feature(self)?;
+        ctx.use_collection_model_feature(self)?;
 
         let mut index = 0;
         while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic(), dist_stream.next_pic()) {
