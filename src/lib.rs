@@ -1,4 +1,4 @@
-use std::{ptr::{self, NonNull}, io, ffi::{CStr, CString}, path::{Path, PathBuf}, fs::File, mem, ffi, intrinsics::copy_nonoverlapping, error, borrow};
+use std::{ptr::{self, NonNull}, io, ffi::{CStr, CString}, path::{Path, PathBuf}, fs::File, mem, ffi, intrinsics::copy_nonoverlapping, error, borrow, fmt};
 use libc;
 use bitflags::bitflags;
 use libvmaf_sys::*;
@@ -25,9 +25,10 @@ pub mod y4m;
 /// use vmaf::*;
 ///
 /// let log_level = LogLevel::Debug;
-/// let score = collect_score("videos/foo.y4m", "videos/bar.y4m", CollectScoreOpts { log_level, ..Default::default() }).unwrap();
+/// let score = collect_score("videos/foo.y4m", "videos/bar.y4m", CollectScoreOpts { log_level, ..Default::default() })?;
 ///
 /// print!("Vmaf score: {}", score);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum LogLevel {
@@ -39,6 +40,7 @@ pub enum LogLevel {
 }
 
 impl Into<VmafLogLevel> for LogLevel {
+    /// This function converts `LogLevel` into `libvmaf_sys::VmafLogLevel`.
     fn into(self) -> VmafLogLevel {
         match self {
             Self::None => VmafLogLevel::VMAF_LOG_LEVEL_NONE,
@@ -51,6 +53,17 @@ impl Into<VmafLogLevel> for LogLevel {
 }
 
 impl Default for LogLevel {
+    /// This function provides a default value for `LogLevel`, which is `None`.
+    ///
+    /// # Example
+    /// ```rust
+    /// use vmaf::*;
+    ///
+    /// let log_level = LogLevel::default();
+    /// let score = collect_score("videos/foo.y4m", "videos/bar.y4m", CollectScoreOpts { log_level, ..Default::default() })?;
+    ///
+    /// print!("Vmaf score: {}", score);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     fn default() -> Self {
         Self::None
     }
@@ -63,6 +76,33 @@ pub enum OutputFormat {
     Json,
     Csv,
     Sub,
+}
+
+impl OutputFormat {
+    pub fn from_path(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        match path.extension() {
+            None => Self::default(),
+            Some(os_str) => match os_str.to_str() {
+                None => Self::default(),
+                Some("xml") => Self::Xml,
+                Some("json") => Self::Json,
+                Some("csv") => Self::Csv,
+                Some("sub") => Self::Sub,
+                Some(_) => Self::default(),
+            },
+        }
+    }
+
+    pub fn extension(&self) -> String {
+        match self {
+            Self::None => String::from("dat"),
+            Self::Xml => String::from("xml"),
+            Self::Json => String::from("json"),
+            Self::Csv => String::from("csv"),
+            Self::Sub => String::from("sub"),
+        }
+    }
 }
 
 impl Into<VmafOutputFormat> for OutputFormat {
@@ -307,6 +347,14 @@ impl Error {
     }
 }
 
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl error::Error for Error { }
+
 pub fn version() -> &'static str {
     let version_cstr = unsafe { CStr::from_ptr(vmaf_version()) };
     version_cstr.to_str().unwrap()
@@ -322,6 +370,8 @@ pub struct CollectScoreOpts {
     pub n_subsample: usize,
     pub cpumask: u64,
     pub pool_method: PoolingMethod,
+    pub output_path: Option<PathBuf>,
+    pub output_format: Option<OutputFormat>,
 }
 
 impl Default for CollectScoreOpts {
@@ -336,6 +386,8 @@ impl Default for CollectScoreOpts {
             n_subsample: model_default_opts.n_subsample,
             cpumask: model_default_opts.cpumask,
             pool_method: model_default_opts.pool_method,
+            output_path: None,
+            output_format: None,
         }
     }
 }
@@ -375,6 +427,19 @@ pub fn collect_score_from_stream_pair(mut ref_stream: impl PictureStream, mut di
 
     ctx.wait_for_all_pictures_flushed()?;
     let score = ctx.pooled_score(&model, opts.pool_method, 0, index)?;
+
+    match (opts.output_path, opts.output_format) {
+        (Some(output_path), Some(output_format)) => ctx.write_score_to_path(output_path, output_format)?,
+        (Some(output_path), None) => {
+            let output_format = OutputFormat::from_path(&output_path);
+            ctx.write_score_to_path(output_path, output_format)?;
+        },
+        (None, Some(output_format)) => {
+            let default_output_path = format!("vmaf_output.{}", output_format.extension());
+            ctx.write_score_to_path(default_output_path, output_format)?;
+        },
+        (None, None) => (),
+    }
 
     Ok(score)
 }
@@ -772,7 +837,7 @@ impl Context {
      *
      * @return 0 on success, or < 0 (a negative errno code) on error.
      */
-    pub fn write_to_path(&self, output_path: impl AsRef<Path>, fmt: OutputFormat) -> Result<(), Error> {
+    pub fn write_score_to_path(&self, output_path: impl AsRef<Path>, fmt: OutputFormat) -> Result<(), Error> {
         let output_path = CString::new(output_path.as_ref().as_os_str().to_raw_bytes()).map_err(|_| Error::InvalidArgument)?;
 
         let r = unsafe { vmaf_write_output(self.ptr.as_ptr(), (&output_path).as_ptr(), fmt.into()) };
@@ -1156,6 +1221,27 @@ fn from_c_uint(u: ffi::c_uint) -> Result<usize, Error> {
     match u.try_into() {
         Ok(u) => Ok(u),
         Err(_) => Err(Error::InvalidArgument),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error;
+    use super::*;
+
+    #[test]
+    fn log_level() -> Result<(), Box<dyn error::Error>> {
+        let log_level = LogLevel::Debug;
+        let score = collect_score("videos/short_original.y4m", "videos/short_high_quality.y4m", CollectScoreOpts { log_level, ..Default::default() })?;
+        assert!(score >= 90.0);
+        assert!(score <= 100.0);
+
+        // default
+        let log_level = LogLevel::default();
+        let score = collect_score("videos/short_original.y4m", "videos/short_low_quality.y4m", CollectScoreOpts { log_level, ..Default::default() })?;
+        assert!(score >= 0.0);
+        assert!(score <= 80.0);
+        Ok(())
     }
 }
 
