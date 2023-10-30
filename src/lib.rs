@@ -58,17 +58,65 @@ impl Default for LogLevel {
     /// # Example
     /// ```rust
     /// use vmaf::*;
-    ///
-    /// let log_level = LogLevel::default();
-    /// let score = collect_score("videos/foo.y4m", "videos/bar.y4m", CollectScoreOpts { log_level, ..Default::default() })?;
-    ///
-    /// print!("Vmaf score: {}", score);
+    /// assert_eq!(LogLevel::default(), LogLevel::None);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     fn default() -> Self {
         Self::None
     }
 }
 
+/// `OutputFormat` represents the various formats for outputting the VMAF computation results.
+/// This enum is used to save the computation results in different formats such as XML, JSON, CSV, and SUB.
+///
+/// # Variants
+///
+/// - `None`: No output.
+/// - `Xml`: Output in XML format.
+/// - `Json`: Output in JSON format.
+/// - `Csv`: Output in CSV format.
+/// - `Sub`: Output in SUB format.
+///
+/// # Example
+///
+/// ```rust
+/// use vmaf::*;
+/// use std::path::Path;
+///
+/// let output_format = OutputFormat::Json;
+/// # let _ = std::fs::remove_file(output_format.default_path());
+/// # assert!(!Path::new("vmaf_output.json").exists());
+/// let score = collect_score("videos/foo.y4m", "videos/bar.y4m", CollectScoreOpts {
+///     output_format: Some(output_format),
+///     ..Default::default()
+/// })?;
+///
+/// assert!(Path::new("vmaf_output.json").exists());
+/// println!("Score: {}", score);
+/// # std::fs::remove_file(output_format.default_path())?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Override default output path
+/// ```rust
+/// use vmaf::*;
+/// use std::path::{Path, PathBuf};
+///
+/// let output_format = OutputFormat::Json;
+/// let output_path = Path::new("custom_name.json");
+/// # let _ = std::fs::remove_file(output_path);
+/// # assert!(!output_path.exists());
+/// let score = collect_score("videos/foo.y4m", "videos/bar.y4m", CollectScoreOpts {
+///     output_format: Some(output_format),
+///     output_path: Some(PathBuf::from(output_path)),
+///     ..Default::default()
+/// })?;
+///
+/// assert!(output_path.exists());
+/// println!("Score: {}", score);
+/// # std::fs::remove_file(output_path)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum OutputFormat {
     None,
@@ -79,7 +127,7 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
-    pub fn from_path(path: impl AsRef<Path>) -> Self {
+    fn from_path(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         match path.extension() {
             None => Self::default(),
@@ -94,7 +142,7 @@ impl OutputFormat {
         }
     }
 
-    pub fn extension(&self) -> String {
+    fn extension(&self) -> String {
         match self {
             Self::None => String::from("dat"),
             Self::Xml => String::from("xml"),
@@ -103,9 +151,26 @@ impl OutputFormat {
             Self::Sub => String::from("sub"),
         }
     }
+
+    /// Generates a default output path based on the current output format.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use vmaf::*;
+    /// use std::path::Path;
+    ///
+    /// let format = OutputFormat::Csv;
+    /// assert_eq!(format.default_path(), Path::new("vmaf_output.csv"));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn default_path(&self) -> PathBuf {
+        PathBuf::from(&format!("vmaf_output.{}", self.extension()))
+    }
 }
 
 impl Into<VmafOutputFormat> for OutputFormat {
+    /// This function converts `OutputFormat` into `libvmaf_sys::VmafOutputFormat`.
     fn into(self) -> VmafOutputFormat {
         match self {
             Self::None => VmafOutputFormat::VMAF_OUTPUT_FORMAT_NONE,
@@ -118,6 +183,15 @@ impl Into<VmafOutputFormat> for OutputFormat {
 }
 
 impl Default for OutputFormat {
+    /// This function provides a default value for `OutputFormat`, which is `Xml`.
+    ///
+    /// # Example
+    /// ```rust
+    /// use vmaf::*;
+    ///
+    /// assert_eq!(OutputFormat::default(), OutputFormat::Xml);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     fn default() -> Self {
         Self::Xml
     }
@@ -435,8 +509,7 @@ pub fn collect_score_from_stream_pair(mut ref_stream: impl PictureStream, mut di
             ctx.write_score_to_path(output_path, output_format)?;
         },
         (None, Some(output_format)) => {
-            let default_output_path = format!("vmaf_output.{}", output_format.extension());
-            ctx.write_score_to_path(default_output_path, output_format)?;
+            ctx.write_score_to_path(output_format.default_path(), output_format)?;
         },
         (None, None) => (),
     }
@@ -1226,21 +1299,61 @@ fn from_c_uint(u: ffi::c_uint) -> Result<usize, Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::error;
+    use std::{error, path::{Path, PathBuf}};
     use super::*;
 
     #[test]
-    fn log_level() -> Result<(), Box<dyn error::Error>> {
+    fn log_level_general_usage() -> Result<(), Box<dyn error::Error>> {
+        // general usage
         let log_level = LogLevel::Debug;
         let score = collect_score("videos/short_original.y4m", "videos/short_high_quality.y4m", CollectScoreOpts { log_level, ..Default::default() })?;
         assert!(score >= 90.0);
         assert!(score <= 100.0);
 
         // default
-        let log_level = LogLevel::default();
-        let score = collect_score("videos/short_original.y4m", "videos/short_low_quality.y4m", CollectScoreOpts { log_level, ..Default::default() })?;
+        assert_eq!(LogLevel::default(), LogLevel::None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn output_format_general_usage() -> Result<(), Box<dyn error::Error>> {
+        // general usage
+        let output_format = OutputFormat::Json;
+        let _ = std::fs::remove_file(output_format.default_path());
+        assert!(!Path::new("vmaf_output.json").exists());
+        let score = collect_score("videos/short_original.y4m", "videos/short_high_quality.y4m", CollectScoreOpts {
+            output_format: Some(output_format),
+            ..Default::default()
+        })?;
+        assert!(Path::new("vmaf_output.json").exists());
+        assert!(score >= 90.0);
+        assert!(score <= 100.0);
+
+        // override default path
+        let output_format = OutputFormat::Json;
+        let output_path = Path::new("custom_name.json");
+        let _ = std::fs::remove_file(output_path);
+        assert!(!output_path.exists());
+        let score = collect_score("videos/short_original.y4m", "videos/short_low_quality.y4m", CollectScoreOpts {
+            output_format: Some(output_format),
+            output_path: Some(PathBuf::from(output_path)),
+            ..Default::default()
+        })?;
+        assert!(output_path.exists());
         assert!(score >= 0.0);
         assert!(score <= 80.0);
+
+        // default path
+        assert_eq!(OutputFormat::None.default_path(), Path::new("vmaf_output.dat"));
+        assert_eq!(OutputFormat::Xml.default_path(), Path::new("vmaf_output.xml"));
+        assert_eq!(OutputFormat::Json.default_path(), Path::new("vmaf_output.json"));
+        assert_eq!(OutputFormat::Csv.default_path(), Path::new("vmaf_output.csv"));
+        assert_eq!(OutputFormat::Sub.default_path(), Path::new("vmaf_output.sub"));
+
+        // default
+        assert_eq!(OutputFormat::default(), OutputFormat::Xml);
+
         Ok(())
     }
 }
