@@ -1071,58 +1071,69 @@ impl Model {
         Ok(())
     }
 
-    pub fn collect_score(self, ref_path: impl TryInto<AutoPictureStream, Error=Error>, dist_path: impl TryInto<AutoPictureStream, Error=Error>, opts: ModelCollectScoreOpts) -> Result<f64, Error> {
+    pub fn collect_score(&self,
+        ref_path: impl TryInto<AutoPictureStream, Error=Error>,
+        dist_path: impl TryInto<AutoPictureStream, Error=Error>,
+        opts: ModelCollectScoreOpts,
+    ) -> Result<f64, Error> {
         let ref_stream = ref_path.try_into()?;
         let dist_stream = dist_path.try_into()?;
 
         self.collect_score_from_stream_pair(ref_stream, dist_stream, opts)
     }
 
-    pub fn collect_score_from_stream_pair(&self, mut ref_stream: impl PictureStream, mut dist_stream: impl PictureStream, opts: ModelCollectScoreOpts) -> Result<f64, Error> {
-        let cfg = Configuration::builder()
-            .log_level(opts.log_level)
-            .n_threads(opts.n_threads)
-            .n_subsample(opts.n_subsample)
-            .cpumask(opts.cpumask)
-            .build()?;
+    pub fn collect_score_from_stream_pair(&self,
+        ref_stream: impl PictureStream,
+        dist_stream: impl PictureStream,
+        opts: ModelCollectScoreOpts,
+    ) -> Result<f64, Error> {
+        let feature_setter = |ctx: &mut Context, model: &Self| {
+            ctx.use_simple_model_feature(model)
+        };
+        let pooler = |ctx: &Context, model: &Self, pool_method: PoolingMethod, start_index: usize, end_index: usize| {
+            ctx.pooled_score(model, pool_method, start_index, end_index)
+        };
 
-        let mut ctx = Context::new(cfg)?;
-        ctx.use_simple_model_feature(self)?;
-
-        let mut index = 0;
-        while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic(), dist_stream.next_pic()) {
-            let ref_pic = ref_pic?;
-            let dist_pic = dist_pic?;
-            ctx.read_pictures(ref_pic, dist_pic, index)?;
-            index += 1;
-        }
-
-        ctx.wait_for_all_pictures_flushed()?;
-        let score = ctx.pooled_score(self, opts.pool_method, 0, index)?;
-
-        match (opts.output_path, opts.output_format) {
-            (Some(output_path), Some(output_format)) => ctx.write_score_to_path(output_path, output_format)?,
-            (Some(output_path), None) => {
-                let output_format = OutputFormat::from_path(&output_path);
-                ctx.write_score_to_path(output_path, output_format)?;
-            },
-            (None, Some(output_format)) => {
-                ctx.write_score_to_path(output_format.default_path(), output_format)?;
-            },
-            (None, None) => (),
-        }
-
-        Ok(score)
+        self.collect_score_impl(feature_setter, pooler, ref_stream, dist_stream, opts)
     }
 
-    pub fn collect_bootstrapped_score(self, ref_path: impl TryInto<AutoPictureStream, Error=Error>, dist_path: impl TryInto<AutoPictureStream, Error=Error>, opts: ModelCollectScoreOpts) -> Result<BootstrappedScore, Error> {
+    pub fn collect_bootstrapped_score(&self,
+        ref_path: impl TryInto<AutoPictureStream, Error=Error>,
+        dist_path: impl TryInto<AutoPictureStream, Error=Error>,
+        opts: ModelCollectScoreOpts,
+    ) -> Result<BootstrappedScore, Error> {
         let ref_stream = ref_path.try_into()?;
         let dist_stream = dist_path.try_into()?;
 
         self.collect_bootstrapped_score_from_stream_pair(ref_stream, dist_stream, opts)
     }
 
-    pub fn collect_bootstrapped_score_from_stream_pair(&self, mut ref_stream: impl PictureStream, mut dist_stream: impl PictureStream, opts: ModelCollectScoreOpts) -> Result<BootstrappedScore, Error> {
+    pub fn collect_bootstrapped_score_from_stream_pair(&self,
+        ref_stream: impl PictureStream,
+        dist_stream: impl PictureStream,
+        opts: ModelCollectScoreOpts,
+    ) -> Result<BootstrappedScore, Error> {
+        let feature_setter = |ctx: &mut Context, model: &Self| {
+            ctx.use_collection_model_feature(model)
+        };
+        let pooler = |ctx: &Context, model: &Self, pool_method: PoolingMethod, start_index: usize, end_index: usize| {
+            ctx.pooled_bootstrapped_score(model, pool_method, start_index, end_index)
+        };
+
+        self.collect_score_impl(feature_setter, pooler, ref_stream, dist_stream, opts)
+    }
+
+    fn collect_score_impl<FeatureSetterFn, PoolerFn, Score>(&self,
+        feature_setter: FeatureSetterFn,
+        pooler: PoolerFn,
+        mut ref_stream: impl PictureStream,
+        mut dist_stream: impl PictureStream,
+        opts: ModelCollectScoreOpts,
+    ) -> Result<Score, Error>
+        where
+            FeatureSetterFn: FnOnce(&mut Context, &Self) -> Result<(), Error>,
+            PoolerFn: FnOnce(&Context, &Self, PoolingMethod, usize, usize) -> Result<Score, Error>,
+    {
         let cfg = Configuration::builder()
             .log_level(opts.log_level)
             .n_threads(opts.n_threads)
@@ -1131,7 +1142,7 @@ impl Model {
             .build()?;
 
         let mut ctx = Context::new(cfg)?;
-        ctx.use_collection_model_feature(self)?;
+        feature_setter(&mut ctx, self)?;
 
         let mut index = 0;
         while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic(), dist_stream.next_pic()) {
@@ -1142,7 +1153,7 @@ impl Model {
         }
 
         ctx.wait_for_all_pictures_flushed()?;
-        let score = ctx.pooled_bootstrapped_score(self, opts.pool_method, 0, index)?;
+        let score = pooler(&ctx, self, opts.pool_method, 0, index)?;
 
         match (opts.output_path, opts.output_format) {
             (Some(output_path), Some(output_format)) => ctx.write_score_to_path(output_path, output_format)?,
