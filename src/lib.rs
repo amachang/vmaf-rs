@@ -491,6 +491,31 @@ pub fn collect_score_from_stream_pair(ref_stream: impl PictureStream, dist_strea
     })
 }
 
+pub fn collect_bootstrapped_score(ref_path: impl TryInto<AutoPictureStream, Error=Error>, dist_path: impl TryInto<AutoPictureStream, Error=Error>, opts: CollectScoreOpts) -> Result<BootstrappedScore, Error> {
+    let ref_stream = ref_path.try_into()?;
+    let dist_stream = dist_path.try_into()?;
+
+    collect_bootstrapped_score_from_stream_pair(ref_stream, dist_stream, opts)
+}
+
+pub fn collect_bootstrapped_score_from_stream_pair(ref_stream: impl PictureStream, dist_stream: impl PictureStream, opts: CollectScoreOpts) -> Result<BootstrappedScore, Error> {
+    let model_cfg = ModelConfig::builder()
+        .name(opts.name)
+        .flags(opts.flags)
+        .build()?;
+
+    let model = Model::new(&model_cfg, &opts.model_version)?;
+    model.collect_bootstrapped_score_from_stream_pair(ref_stream, dist_stream, ModelCollectScoreOpts {
+        log_level: opts.log_level,
+        n_threads: opts.n_threads,
+        n_subsample: opts.n_subsample,
+        cpumask: opts.cpumask,
+        pool_method: opts.pool_method,
+        output_path: opts.output_path,
+        output_format: opts.output_format,
+    })
+}
+
 #[derive(Debug)]
 pub struct Context {
     ptr: NonNull<VmafContext>,
@@ -1074,6 +1099,50 @@ impl Model {
 
         ctx.wait_for_all_pictures_flushed()?;
         let score = ctx.pooled_score(self, opts.pool_method, 0, index)?;
+
+        match (opts.output_path, opts.output_format) {
+            (Some(output_path), Some(output_format)) => ctx.write_score_to_path(output_path, output_format)?,
+            (Some(output_path), None) => {
+                let output_format = OutputFormat::from_path(&output_path);
+                ctx.write_score_to_path(output_path, output_format)?;
+            },
+            (None, Some(output_format)) => {
+                ctx.write_score_to_path(output_format.default_path(), output_format)?;
+            },
+            (None, None) => (),
+        }
+
+        Ok(score)
+    }
+
+    pub fn collect_bootstrapped_score(self, ref_path: impl TryInto<AutoPictureStream, Error=Error>, dist_path: impl TryInto<AutoPictureStream, Error=Error>, opts: ModelCollectScoreOpts) -> Result<BootstrappedScore, Error> {
+        let ref_stream = ref_path.try_into()?;
+        let dist_stream = dist_path.try_into()?;
+
+        self.collect_bootstrapped_score_from_stream_pair(ref_stream, dist_stream, opts)
+    }
+
+    pub fn collect_bootstrapped_score_from_stream_pair(&self, mut ref_stream: impl PictureStream, mut dist_stream: impl PictureStream, opts: ModelCollectScoreOpts) -> Result<BootstrappedScore, Error> {
+        let cfg = Configuration::builder()
+            .log_level(opts.log_level)
+            .n_threads(opts.n_threads)
+            .n_subsample(opts.n_subsample)
+            .cpumask(opts.cpumask)
+            .build()?;
+
+        let mut ctx = Context::new(cfg)?;
+        ctx.use_simple_model_feature(self)?;
+
+        let mut index = 0;
+        while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic(), dist_stream.next_pic()) {
+            let ref_pic = ref_pic?;
+            let dist_pic = dist_pic?;
+            ctx.read_pictures(ref_pic, dist_pic, index)?;
+            index += 1;
+        }
+
+        ctx.wait_for_all_pictures_flushed()?;
+        let score = ctx.pooled_bootstrapped_score(self, opts.pool_method, 0, index)?;
 
         match (opts.output_path, opts.output_format) {
             (Some(output_path), Some(output_format)) => ctx.write_score_to_path(output_path, output_format)?,
