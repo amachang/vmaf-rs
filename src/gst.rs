@@ -1,4 +1,4 @@
-use std::{io::{self, BufReader}, fs::File, path::Path, sync::{mpsc, Arc, Mutex, Weak, Once}, thread};
+use std::{io::{self, BufReader}, fs::File, path::Path, sync::{Arc, Mutex, Weak, Once}};
 use crate::{Error, PixelFormat, Picture, from_c_uint};
 use gstreamer as gst;
 use gstreamer_video as gst_video;
@@ -181,20 +181,19 @@ impl<'data> Frame<'data> {
 }
 
 #[derive(Debug)]
-pub struct PictureStream {
+pub struct PictureStream<R: io::Read + io::Seek + Send + Sync + 'static> {
     _gst: Arc<Gst>,
-    data: Option<PictureStreamData>,
+    data: Option<PictureStreamData<R>>,
 }
 
 #[derive(Debug)]
-struct PictureStreamData {
+struct PictureStreamData<R: io::Read + io::Seek + Send + Sync + 'static> {
     pipeline: gst::Pipeline,
     appsink: gst_app::AppSink,
-    read_thread_handle: thread::JoinHandle<()>,
-    read_thread_term_sender: mpsc::Sender<()>,
+    _read: Arc<Mutex<R>>,
 }
 
-impl crate::PictureStream for PictureStream {
+impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for PictureStream<R> {
     fn next_pic(&mut self) -> Option<Result<Picture, Error>> {
         let Some(data) = self.data.as_ref() else {
             return None;
@@ -226,26 +225,15 @@ impl crate::PictureStream for PictureStream {
     }
 }
 
-impl PictureStream {
+impl PictureStream<BufReader<File>> {
     pub fn from_path(path: impl AsRef<Path>, allow_hwaccel: bool) -> Result<Self, Error> {
         let read = BufReader::new(File::open(path).map_err(Error::IoError)?);
         Self::new(read, allow_hwaccel)
     }
-
-    fn destroy_pipeline_if_needed(&mut self) {
-        let Some(data) = self.data.take() else {
-            return;
-        };
-
-        // ignore error
-        let _ = data.pipeline.set_state(gst::State::Null);
-        let _ = data.read_thread_term_sender.send(());
-        let _ = data.read_thread_handle.join();
-    }
 }
 
-impl PictureStream {
-    pub fn new<R: io::Read + Send + 'static>(read: R, allow_hwaccel: bool) -> Result<Self, Error> {
+impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
+    pub fn new(read: R, allow_hwaccel: bool) -> Result<Self, Error> {
         let gst = {
             let mut lock = GST_REF_COUNTER.lock().unwrap();
             lock.refer()
@@ -256,7 +244,7 @@ impl PictureStream {
         let appsrc = gst_app::AppSrc::builder()
             .caps(&gst::Caps::new_any())
             .format(gst::Format::Bytes)
-            .block(true)
+            .stream_type(gst_app::AppStreamType::Seekable)
             .build();
 
         let decodebin = gst::ElementFactory::make("decodebin")
@@ -285,48 +273,68 @@ impl PictureStream {
         pipeline.add_many([&appsrc.upcast_ref(), &decodebin, &appsink.upcast_ref()])?;
         gst::Element::link_many([&appsrc.upcast_ref(), &decodebin])?;
 
-        let (read_thread_term_sender, read_thread_term_receiver) = mpsc::channel();
-        let read_thread_handle = Self::setup_appsrc_stream_connection(&appsrc, read, read_thread_term_receiver);
         Self::setup_docedbin_connection(&pipeline, &decodebin, &appsink);
+
+        let read = Arc::new(Mutex::new(read));
+        Self::setup_appsrc_stream_connection(&appsrc, read.clone());
 
         pipeline.set_state(gst::State::Playing)?;
 
         Ok(Self {
             _gst: gst,
             data: Some(PictureStreamData {
-                pipeline, appsink,
-                read_thread_handle, read_thread_term_sender,
+                pipeline, appsink, _read: read,
             }),
         })
     }
 
-    fn setup_appsrc_stream_connection<R: io::Read + Send + 'static>(appsrc: &gst_app::AppSrc, mut read: R, term_receiver: mpsc::Receiver<()>) -> thread::JoinHandle<()> {
+    fn setup_appsrc_stream_connection(appsrc: &gst_app::AppSrc, read: Arc<Mutex<R>>) {
         let buffer_size = 4096;
-        let appsrc_weak = appsrc.downgrade();
-        thread::spawn(move || {
-            // TODO error handling
-            let appsrc = appsrc_weak.upgrade().unwrap();
-            loop {
-                let mut buffer = gst::Buffer::with_size(buffer_size).unwrap();
+
+        let read_weak_for_need_data = Arc::downgrade(&read);
+        let read_weak_for_seek_data = Arc::downgrade(&read);
+        let callbacks = gst_app::AppSrcCallbacks::builder()
+            .need_data(move |appsrc, size| {
+                // TODO error handling
+                let Some(read) = read_weak_for_need_data.upgrade() else {
+                    return;
+                };
+                let mut read = read.lock().unwrap();
+
+                let size = from_c_uint(size).unwrap();
+                let size = usize::min(size, buffer_size);
+                let mut buffer = gst::Buffer::with_size(size).unwrap();
+
                 let buffer_ref = buffer.get_mut().unwrap();
-                let read_size = {
+                let size = {
                     let mut buffer_map = buffer_ref.map_writable().unwrap();
                     let buffer_slice = buffer_map.as_mut_slice();
                     read.read(buffer_slice).unwrap()
                 };
-                if read_size == 0 {
+                if size == 0 {
                     appsrc.end_of_stream().unwrap();
-                    break;
+                } else {
+                    buffer_ref.set_size(size);
+                    appsrc.push_buffer(buffer).unwrap();
                 };
-                buffer_ref.set_size(read_size);
-                appsrc.push_buffer(buffer).unwrap();
-                match term_receiver.try_recv() {
-                    Err(mpsc::TryRecvError::Empty) => continue,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
-                    Ok(()) => break,
-                }
-            }
-        })
+            })
+            .seek_data(move |_appsrc, offset| {
+                // TODO error handling
+                let Some(read) = read_weak_for_seek_data.upgrade() else {
+                    return false
+                };
+                let mut read = match read.lock() {
+                    Err(_) => return false,
+                    Ok(read) => read,
+                };
+                let pos = match read.seek(io::SeekFrom::Start(offset)) {
+                    Err(_) => return false,
+                    Ok(pos) => pos,
+                };
+                pos == offset
+            })
+            .build();
+        appsrc.set_callbacks(callbacks);
     }
 
     fn setup_docedbin_connection(pipeline: &gst::Pipeline, decodebin: &gst::Element, appsink: &gst_app::AppSink) {
@@ -368,9 +376,18 @@ impl PictureStream {
             })
         });
     }
+
+    fn destroy_pipeline_if_needed(&mut self) {
+        let Some(data) = self.data.take() else {
+            return;
+        };
+
+        // ignore error
+        let _ = data.pipeline.set_state(gst::State::Null);
+    }
 }
 
-impl Drop for PictureStream {
+impl<R: io::Read + io::Seek + Send + Sync + 'static> Drop for PictureStream<R> {
     fn drop(&mut self) {
         self.destroy_pipeline_if_needed();
     }

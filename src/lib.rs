@@ -12,13 +12,15 @@ pub mod gst;
 #[cfg(not(feature="gst"))]
 mod gst {
     pub fn supported() -> bool { false }
-    pub struct PictureStream { }
-    impl PictureStream  {
+    pub struct PictureStream<R: std::io::Read + std::io::Seek + Send + Sync + 'static> {
+        _marker: std::marker::PhantomData<R>,
+    }
+    impl PictureStream<std::io::BufReader<std::fs::File>>  {
         pub fn from_path(_path: impl AsRef<std::path::Path>, _hwaccel: bool) -> Result<Self, super::Error> {
             panic!("need gst feature");
         }
     }
-    impl super::PictureStream for PictureStream {
+    impl<R: std::io::Read + std::io::Seek + Send + Sync + 'static> super::PictureStream for PictureStream<R> {
         fn next_pic(&mut self) -> Option<Result<super::Picture, super::Error>> {
             panic!("need gst feature");
         }
@@ -1282,7 +1284,7 @@ pub trait PictureStream {
 
 pub enum AutoPictureStream {
     Y4m(y4m::PictureStream<BufReader<File>>),
-    Gstreamer(gst::PictureStream),
+    Gstreamer(gst::PictureStream<BufReader<File>>),
     Dynamic(Box<dyn PictureStream>),
 }
 
