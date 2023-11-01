@@ -1,4 +1,4 @@
-use std::{io, fs::File, path::Path};
+use std::{io::{self, BufReader}, fs::File, path::Path};
 use crate::{Error, PixelFormat, Picture};
 use y4m;
 
@@ -132,9 +132,9 @@ impl<R: io::Read> crate::PictureStream for PictureStream<R> {
     }
 }
 
-impl PictureStream<File> {
+impl PictureStream<BufReader<File>> {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, Error> {
-        Self::new(File::open(path).map_err(Error::IoError)?)
+        Self::new(BufReader::new(File::open(path).map_err(Error::IoError)?))
     }
 }
 
