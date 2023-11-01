@@ -140,7 +140,7 @@ impl PictureStream<BufReader<File>> {
 
 impl<R: io::Read> PictureStream<R> {
     pub fn new(read: R) -> Result<Self, Error> {
-        let dec = y4m::decode(read).map_err(Error::from)?;
+        let dec = y4m::decode(read)?;
         Ok(Self::from_y4m_dec(dec))
     }
 

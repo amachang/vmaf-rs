@@ -8,11 +8,20 @@ edition = "2021"
 [dependencies]
 bitflags = "2.4.0"
 libc = "0.2.149"
-libvmaf-sys = { path = "./libvmaf-sys", features = [] }
 os_str_bytes = "6.5.1"
 y4m = "0.8.0"
 
+libvmaf-sys = { path = "./libvmaf-sys", features = [] }
+
+glib = { version = "0.18.2", optional = true }
+gstreamer = { version = "0.21.1", optional = true }
+gstreamer-video = { version = "0.21.1", optional = true }
+gstreamer-app = { version = "0.21.1", optional = true }
+lazy_static = "1.4.0"
+
 [features]
+default = ["gst"]
+gst = ["glib", "gstreamer", "gstreamer-video", "gstreamer-app"]
 float = ["libvmaf-sys/float"]
 avx512 = ["libvmaf-sys/avx512"]
 

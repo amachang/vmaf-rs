@@ -1,10 +1,29 @@
-use std::{ptr::{self, NonNull}, io, ffi::{CStr, CString}, path::{Path, PathBuf}, fs::File, mem, ffi, intrinsics::copy_nonoverlapping, error, borrow, fmt};
+use std::{ptr::{self, NonNull}, io::{self, BufReader}, ffi::{CStr, CString}, path::{Path, PathBuf}, fs::File, mem, ffi, intrinsics::copy_nonoverlapping, error, borrow, fmt};
 use libc;
 use bitflags::bitflags;
 use libvmaf_sys::*;
 use os_str_bytes::OsStrBytes;
 
 pub mod y4m;
+
+#[cfg(feature="gst")]
+pub mod gst;
+
+#[cfg(not(feature="gst"))]
+mod gst {
+    pub fn supported() -> bool { false }
+    pub struct PictureStream { }
+    impl PictureStream  {
+        pub fn from_path(_path: impl AsRef<std::path::Path>, _hwaccel: bool) -> Result<Self, super::Error> {
+            panic!("need gst feature");
+        }
+    }
+    impl super::PictureStream for PictureStream {
+        fn next_pic(&mut self) -> Option<Result<super::Picture, super::Error>> {
+            panic!("need gst feature");
+        }
+    }
+}
 
 /// Represents the different levels of logging for VMAF.
 ///
@@ -406,6 +425,7 @@ pub enum Error {
     IoError(io::Error),
     FailedInCustomPictureStreamBuilder(Box<dyn error::Error>),
     InvalidVideoFrameFormat(String),
+    GstreamerError(String),
 }
 
 impl Error {
@@ -1261,7 +1281,8 @@ pub trait PictureStream {
 }
 
 pub enum AutoPictureStream {
-    Y4m(y4m::PictureStream<File>),
+    Y4m(y4m::PictureStream<BufReader<File>>),
+    Gstreamer(gst::PictureStream),
     Dynamic(Box<dyn PictureStream>),
 }
 
@@ -1269,6 +1290,7 @@ impl PictureStream for AutoPictureStream {
     fn next_pic(&mut self) -> Option<Result<Picture, Error>> {
         match self {
             Self::Y4m(stream) => stream.next_pic(),
+            Self::Gstreamer(stream) => stream.next_pic(),
             Self::Dynamic(stream) => stream.next_pic(),
         }
     }
@@ -1281,7 +1303,11 @@ impl AutoPictureStream {
             None => Err(Error::InvalidArgument),
             Some(ext) => match ext.to_str() {
                 Some("y4m") => Ok(Self::Y4m(y4m::PictureStream::from_path(path)?)),
-                _ => Err(Error::InvalidArgument),
+                _ => if gst::supported() {
+                    Ok(Self::Gstreamer(gst::PictureStream::from_path(path, false)?))
+                } else {
+                    Err(Error::InvalidArgument)
+                },
             },
         }
     }
@@ -1347,7 +1373,7 @@ impl Picture {
             assert!(src_row_stride * component_height <= frame_component.data().len());
 
             // error when negative pointer diff
-            let dst_row_stride = ptr.stride[component_index].try_into().map_err(|_| Error::InvalidArgument)?;
+            let dst_row_stride: usize = ptr.stride[component_index].try_into().map_err(|_| Error::InvalidArgument)?;
             assert!(component_width * pixel_stride <= dst_row_stride);
 
             let src_data = frame_component.data().as_ptr() as *const u8;
@@ -1384,14 +1410,14 @@ impl Drop for Picture {
     }
 }
 
-fn to_c_uint(u: usize) -> Result<ffi::c_uint, Error> {
+fn to_c_uint<T: TryFrom<usize>>(u: usize) -> Result<T, Error> {
     match u.try_into() {
         Ok(u) => Ok(u),
         Err(_) => Err(Error::InvalidArgument),
     }
 }
 
-fn from_c_uint(u: ffi::c_uint) -> Result<usize, Error> {
+fn from_c_uint<T: TryInto<usize>>(u: T) -> Result<usize, Error> {
     match u.try_into() {
         Ok(u) => Ok(u),
         Err(_) => Err(Error::InvalidArgument),
