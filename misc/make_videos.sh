@@ -16,7 +16,24 @@ function make_y4m {
     fi
 }
 
-function encode_y4m {
+function encode_h265() {
+    original_path="$1"
+    path="$2"
+    crf="$3"
+    if [ ! -f "$path" ]; then
+        gst-launch-1.0 -e \
+            qtmux name=mux ! \
+            filesink location="$path" \
+            \
+            filesrc location="$original_path" ! \
+            y4mdec ! \
+            x265enc option-string=crf="$crf" ! \
+            h265parse ! \
+            mux.video_0
+    fi
+}
+
+function encode_decode_y4m {
     original_path="$1"
     path="$2"
     crf="$3"
@@ -38,12 +55,14 @@ function encode_y4m {
 }
 
 make_y4m videos/original.y4m 300 320 240
-encode_y4m videos/original.y4m videos/low_quality.y4m 51
-encode_y4m videos/original.y4m videos/high_quality.y4m 10
+encode_h265 videos/original.y4m videos/low_quality.mp4 51
+encode_h265 videos/original.y4m videos/high_quality.mp4 10
+encode_decode_y4m videos/original.y4m videos/low_quality.y4m 51
+encode_decode_y4m videos/original.y4m videos/high_quality.y4m 10
 
 make_y4m videos/short_original.y4m 2 160 120
-encode_y4m videos/short_original.y4m videos/short_low_quality.y4m 51
-encode_y4m videos/short_original.y4m videos/short_high_quality.y4m 10
+encode_decode_y4m videos/short_original.y4m videos/short_low_quality.y4m 51
+encode_decode_y4m videos/short_original.y4m videos/short_high_quality.y4m 10
 
 # To have files with a meaningless name, for example codes
 if [ ! -f videos/foo.y4m ]; then
