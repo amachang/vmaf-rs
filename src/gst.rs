@@ -1,4 +1,4 @@
-use std::{io::{self, BufReader}, fs::File, path::Path, sync::{Arc, Mutex, Weak, Once}};
+use std::{io::{self, BufReader}, fs::File, path::Path, sync::{Arc, Mutex, Weak, Once, Condvar}, thread};
 use crate::{Error, PixelFormat, Picture, from_c_uint};
 use gstreamer as gst;
 use gstreamer_video as gst_video;
@@ -233,7 +233,7 @@ impl PictureStream<BufReader<File>> {
 }
 
 impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
-    pub fn new(read: R, allow_hwaccel: bool) -> Result<Self, Error> {
+    pub fn new(mut read: R, allow_hwaccel: bool) -> Result<Self, Error> {
         let gst = {
             let mut lock = GST_REF_COUNTER.lock().unwrap();
             lock.refer()
@@ -241,9 +241,23 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
 
         let pipeline = gst::Pipeline::default();
 
+        // TODO impl From<io::Error>
+        let stream_size = {
+            let pos = read.stream_position().map_err(Error::IoError)?;
+            let size = read.seek(io::SeekFrom::End(0)).map_err(Error::IoError)?;
+            read.seek(io::SeekFrom::Start(pos)).map_err(Error::IoError)?;
+            size
+        };
+
+        // gstreamer accept i64
+        let stream_size: i64 = match stream_size.try_into() {
+            Err(err) => return Err(Error::GstreamerError(format!("Invalid Stream Size: {}", err))),
+            Ok(stream_size) => stream_size,
+        };
+
         let appsrc = gst_app::AppSrc::builder()
-            .caps(&gst::Caps::new_any())
             .format(gst::Format::Bytes)
+            .size(stream_size) // if no stream_size, then some gstreamer element couldn't use the appsrc as seekable
             .stream_type(gst_app::AppStreamType::Seekable)
             .build();
 
@@ -276,7 +290,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
         Self::setup_docedbin_connection(&pipeline, &decodebin, &appsink);
 
         let read = Arc::new(Mutex::new(read));
-        Self::setup_appsrc_stream_connection(&appsrc, read.clone());
+        Self::setup_appsrc_stream_connection(appsrc, read.clone());
 
         pipeline.set_state(gst::State::Playing)?;
 
@@ -288,38 +302,65 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
         })
     }
 
-    fn setup_appsrc_stream_connection(appsrc: &gst_app::AppSrc, read: Arc<Mutex<R>>) {
-        let buffer_size = 4096;
+    fn setup_appsrc_stream_connection(appsrc: gst_app::AppSrc, read: Arc<Mutex<R>>) {
+        let running_cond_pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let running_cond_pair_for_need_data = Arc::clone(&running_cond_pair);
+        let running_cond_pair_for_enough_data = Arc::clone(&running_cond_pair);
 
-        let read_weak_for_need_data = Arc::downgrade(&read);
-        let read_weak_for_seek_data = Arc::downgrade(&read);
-        let callbacks = gst_app::AppSrcCallbacks::builder()
-            .need_data(move |appsrc, size| {
-                // TODO error handling
-                let Some(read) = read_weak_for_need_data.upgrade() else {
-                    return;
-                };
-                let mut read = read.lock().unwrap();
+        let read_weak = Arc::downgrade(&read);
+        let appsrc_weak = appsrc.downgrade();
+        thread::spawn(move || {
+            // TODO error handling
+            let Some(read) = read_weak.upgrade() else {
+                return;
+            };
+            let Some(appsrc) = appsrc_weak.upgrade() else {
+                return;
+            };
+            loop {
+                let (running_cond, cvar) = &*running_cond_pair;
+                {
+                    let mut running_cond = running_cond.lock().unwrap();
+                    while !*running_cond {
+                        running_cond = cvar.wait(running_cond).unwrap();
+                    }
+                }
 
-                let size = from_c_uint(size).unwrap();
-                let size = usize::min(size, buffer_size);
+                let size = 4096;
                 let mut buffer = gst::Buffer::with_size(size).unwrap();
 
                 let buffer_ref = buffer.get_mut().unwrap();
                 let size = {
                     let mut buffer_map = buffer_ref.map_writable().unwrap();
                     let buffer_slice = buffer_map.as_mut_slice();
+                    let mut read = read.lock().unwrap();
                     read.read(buffer_slice).unwrap()
                 };
                 if size == 0 {
                     appsrc.end_of_stream().unwrap();
+                    break;
                 } else {
                     buffer_ref.set_size(size);
                     appsrc.push_buffer(buffer).unwrap();
                 };
+            };
+        });
+
+        let read_weak_for_seek_data = Arc::downgrade(&read);
+        let callbacks = gst_app::AppSrcCallbacks::builder()
+            .need_data(move |_appsrc, _size| {
+                let (running_cond, cvar) = &*running_cond_pair_for_need_data;
+                let mut running_cond = running_cond.lock().unwrap();
+                *running_cond = true;
+                cvar.notify_all();
+            })
+            .enough_data(move |_appsrc| {
+                let (running_cond, cvar) = &*running_cond_pair_for_enough_data;
+                let mut running_cond = running_cond.lock().unwrap();
+                *running_cond = false;
+                cvar.notify_all();
             })
             .seek_data(move |_appsrc, offset| {
-                // TODO error handling
                 let Some(read) = read_weak_for_seek_data.upgrade() else {
                     return false
                 };
