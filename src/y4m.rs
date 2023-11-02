@@ -1,6 +1,36 @@
-use std::{io::{self, BufReader}, fs::File, path::Path};
-use crate::{Error, PixelFormat, Picture};
+use std::{fmt, error, io::{self, BufReader}, fs::File, path::Path};
+use crate::{PixelFormat, Picture};
 use y4m;
+
+#[derive(Debug)]
+pub enum Error {
+    InvalidVideoFrameFormat(String),
+    IoError(io::Error),
+    InvalidArgument,
+    UnknownColorspace,
+    OutOfMemory,
+}
+
+impl From<y4m::Error> for Error {
+    fn from(err: y4m::Error) -> Self {
+        match err {
+            y4m::Error::BadInput => Error::InvalidArgument,
+            y4m::Error::UnknownColorspace => Error::UnknownColorspace,
+            y4m::Error::ParseError(err) => Error::InvalidVideoFrameFormat(err.to_string()),
+            y4m::Error::IoError(err) => Error::IoError(err),
+            y4m::Error::OutOfMemory => Error::OutOfMemory,
+            y4m::Error::EOF => unreachable!(),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl error::Error for Error { }
 
 #[derive(Debug)]
 struct Component<'data> {
@@ -118,16 +148,14 @@ pub struct PictureStream<R: io::Read> {
 }
 
 impl<R: io::Read> crate::PictureStream for PictureStream<R> {
-    fn next_pic(&mut self) -> Option<Result<Picture, Error>> {
+    fn next_pic(&mut self) -> Option<Result<Picture, crate::Error>> {
         match self.dec.read_frame() {
-            Ok(y4m_frame) => {
-                match Frame::new(self.colorspace, self.width, self.height, &y4m_frame) {
-                    Ok(frame) => Some(Picture::new(&frame)),
-                    Err(err) => Some(Err(err)),
-                }
+            Ok(y4m_frame) => match Frame::new(self.colorspace, self.width, self.height, &y4m_frame) {
+                Ok(frame) => Some(Picture::new(&frame)),
+                Err(err) => Some(Err(err.into())),
             },
             Err(y4m::Error::EOF) => None,
-            Err(err) => Some(Err(Error::from(err))),
+            Err(err) => Some(Err(Error::from(err).into())),
         }
     }
 }
@@ -149,18 +177,6 @@ impl<R: io::Read> PictureStream<R> {
         let width = dec.get_width();
         let height = dec.get_height();
         Self { dec, colorspace, width, height }
-    }
-}
-
-impl From<y4m::Error> for Error {
-    fn from(err: y4m::Error) -> Self {
-        match err {
-            y4m::Error::BadInput | y4m::Error::UnknownColorspace => Error::InvalidArgument,
-            y4m::Error::ParseError(err) => Error::InvalidVideoFrameFormat(err.to_string()),
-            y4m::Error::IoError(err) => Error::IoError(err),
-            y4m::Error::OutOfMemory => Error::OutOfMemory,
-            y4m::Error::EOF => unreachable!(),
-        }
     }
 }
 

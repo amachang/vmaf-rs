@@ -1,12 +1,50 @@
-use std::{io::{self, BufReader}, fs::File, path::Path, sync::{Arc, Mutex, Weak, Once, Condvar}, thread};
-use crate::{Error, PixelFormat, Picture, from_c_uint};
+use std::{fmt, error, io::{self, BufReader}, fs::File, path::Path, sync::{Arc, Mutex, Weak, Once, Condvar}, thread, num::TryFromIntError};
+use crate::{PixelFormat, Picture};
 use gstreamer as gst;
 use gstreamer_video as gst_video;
 use gstreamer_app as gst_app;
 use gst::prelude::*;
 use lazy_static::lazy_static;
 
+
 pub fn supported() -> bool { true }
+
+
+#[derive(Debug)]
+pub enum Error {
+    UnsupportedVideoFormat(gst_video::VideoFormat),
+    GlibError(String),
+    StateChangeError(String),
+    FailedConversionInteger(String),
+    IoError(io::Error),
+}
+
+impl From<glib::BoolError> for Error {
+    fn from(err: glib::BoolError) -> Self {
+        Error::GlibError(err.message.into_owned())
+    }
+}
+
+impl From<gst::StateChangeError> for Error {
+    fn from(err: gst::StateChangeError) -> Self {
+        Error::StateChangeError(format!("Gstreamer element failed to change state: {}", err))
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Self {
+        Error::IoError(err)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl error::Error for Error { }
+
 
 #[derive(Debug)]
 struct Gst;
@@ -131,9 +169,9 @@ impl<'data> Frame<'data> {
             gst_video::VideoFormat::I42212le => (PixelFormat::Yuv422p, 12, (2, 1)),
             gst_video::VideoFormat::Y444 => (PixelFormat::Yuv444p, 8, (1, 1)),
             gst_video::VideoFormat::Y44410le => (PixelFormat::Yuv444p, 10, (1, 1)),
-            _ => return Err(Error::InvalidArgument)
+            format => return Err(Error::UnsupportedVideoFormat(format)),
         };
-        let n_components: usize = frame.n_components().try_into().map_err(|_| Error::InvalidArgument)?;
+        let n_components = from_c_uint(frame.n_components())?;
         assert_eq!(n_components, if pixel_format == PixelFormat::Yuv400p { 1 } else { 3 });
 
         let pixel_stride = depth.div_ceil(8);
@@ -194,7 +232,7 @@ struct PictureStreamData<R: io::Read + io::Seek + Send + Sync + 'static> {
 }
 
 impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for PictureStream<R> {
-    fn next_pic(&mut self) -> Option<Result<Picture, Error>> {
+    fn next_pic(&mut self) -> Option<Result<Picture, crate::Error>> {
         let Some(data) = self.data.as_ref() else {
             return None;
         };
@@ -204,21 +242,21 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for Pi
             return None;
         }
         let sample = match data.appsink.pull_sample() {
-            Err(err) => return Some(Err(Error::from(err))),
+            Err(err) => return Some(Err(Error::from(err).into())),
             Ok(sample) => sample,
         };
         let caps = sample.caps().unwrap();
         let buffer = sample.buffer().unwrap();
         let info = match gst_video::VideoInfo::from_caps(caps) {
-            Err(err) => return Some(Err(Error::from(err))),
+            Err(err) => return Some(Err(Error::from(err).into())),
             Ok(info) => info,
         };
         let video_frame = match gst_video::VideoFrameRef::from_buffer_ref_readable(&buffer, &info) {
-            Err(err) => return Some(Err(Error::from(err))),
+            Err(err) => return Some(Err(Error::from(err).into())),
             Ok(video_frame) => video_frame,
         };
         let frame = match Frame::new(&video_frame) {
-            Err(err) => return Some(Err(err)),
+            Err(err) => return Some(Err(err.into())),
             Ok(frame) => frame,
         };
         Some(Picture::new(&frame))
@@ -227,7 +265,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for Pi
 
 impl PictureStream<BufReader<File>> {
     pub fn from_path(path: impl AsRef<Path>, allow_hwaccel: bool) -> Result<Self, Error> {
-        let read = BufReader::new(File::open(path).map_err(Error::IoError)?);
+        let read = BufReader::new(File::open(path)?);
         Self::new(read, allow_hwaccel)
     }
 }
@@ -243,15 +281,15 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
 
         // TODO impl From<io::Error>
         let stream_size = {
-            let pos = read.stream_position().map_err(Error::IoError)?;
-            let size = read.seek(io::SeekFrom::End(0)).map_err(Error::IoError)?;
-            read.seek(io::SeekFrom::Start(pos)).map_err(Error::IoError)?;
+            let pos = read.stream_position()?;
+            let size = read.seek(io::SeekFrom::End(0))?;
+            read.seek(io::SeekFrom::Start(pos))?;
             size
         };
 
         // gstreamer accept i64
         let stream_size: i64 = match stream_size.try_into() {
-            Err(err) => return Err(Error::GstreamerError(format!("Invalid Stream Size: {}", err))),
+            Err(err) => return Err(Error::FailedConversionInteger(format!("Invalid Stream Size: {}", err))),
             Ok(stream_size) => stream_size,
         };
 
@@ -434,15 +472,10 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> Drop for PictureStream<R> {
     }
 }
 
-impl From<glib::BoolError> for Error {
-    fn from(err: glib::BoolError) -> Self {
-        Error::GstreamerError(err.message.into_owned())
-    }
-}
-
-impl From<gst::StateChangeError> for Error {
-    fn from(err: gst::StateChangeError) -> Self {
-        Error::GstreamerError(format!("Gstreamer element failed to change state: {}", err))
+fn from_c_uint<T: TryInto<usize, Error = TryFromIntError>>(u: T) -> Result<usize, Error> {
+    match u.try_into() {
+        Ok(u) => Ok(u),
+        Err(err) => Err(Error::FailedConversionInteger(format!("{:?}", err))),
     }
 }
 
