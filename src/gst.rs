@@ -232,34 +232,24 @@ struct PictureStreamData<R: io::Read + io::Seek + Send + Sync + 'static> {
 }
 
 impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for PictureStream<R> {
-    fn next_pic(&mut self) -> Option<Result<Picture, crate::Error>> {
+    fn next_pic(&mut self) -> Result<Option<Picture>, crate::Error> {
         let Some(data) = self.data.as_ref() else {
-            return None;
+            return Ok(None);
         };
 
         if data.appsink.is_eos() {
             self.destroy_pipeline_if_needed();
-            return None;
+            return Ok(None);
         }
-        let sample = match data.appsink.pull_sample() {
-            Err(err) => return Some(Err(Error::from(err).into())),
-            Ok(sample) => sample,
-        };
+
+        let sample: gst::Sample = data.appsink.pull_sample().map_err(Error::from)?;
         let caps = sample.caps().unwrap();
         let buffer = sample.buffer().unwrap();
-        let info = match gst_video::VideoInfo::from_caps(caps) {
-            Err(err) => return Some(Err(Error::from(err).into())),
-            Ok(info) => info,
-        };
-        let video_frame = match gst_video::VideoFrameRef::from_buffer_ref_readable(&buffer, &info) {
-            Err(err) => return Some(Err(Error::from(err).into())),
-            Ok(video_frame) => video_frame,
-        };
-        let frame = match Frame::new(&video_frame) {
-            Err(err) => return Some(Err(err.into())),
-            Ok(frame) => frame,
-        };
-        Some(Picture::new(&frame))
+        let info = gst_video::VideoInfo::from_caps(caps).map_err(Error::from)?;
+        let video_frame = gst_video::VideoFrameRef::from_buffer_ref_readable(&buffer, &info).map_err(Error::from)?;
+        let frame = Frame::new(&video_frame)?;
+
+        Ok(Some(Picture::new(&frame)?))
     }
 }
 

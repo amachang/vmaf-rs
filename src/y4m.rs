@@ -148,14 +148,14 @@ pub struct PictureStream<R: io::Read> {
 }
 
 impl<R: io::Read> crate::PictureStream for PictureStream<R> {
-    fn next_pic(&mut self) -> Option<Result<Picture, crate::Error>> {
+    fn next_pic(&mut self) -> Result<Option<Picture>, crate::Error> {
         match self.dec.read_frame() {
             Ok(y4m_frame) => match Frame::new(self.colorspace, self.width, self.height, &y4m_frame) {
-                Ok(frame) => Some(Picture::new(&frame)),
-                Err(err) => Some(Err(err.into())),
+                Ok(frame) => Ok(Some(Picture::new(&frame)?)),
+                Err(err) => Err(err.into()),
             },
-            Err(y4m::Error::EOF) => None,
-            Err(err) => Some(Err(Error::from(err).into())),
+            Err(y4m::Error::EOF) => Ok(None),
+            Err(err) => Err(Error::from(err).into()),
         }
     }
 }

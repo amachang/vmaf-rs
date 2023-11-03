@@ -1,4 +1,4 @@
-use std::{io::{self, BufReader}, path::{Path, PathBuf}, fs::File, error, borrow, fmt, ffi};
+use std::{io::{self, BufReader}, path::{Path, PathBuf}, fs::File, error, borrow, fmt, ffi, marker::PhantomData, sync::atomic::{AtomicUsize, Ordering}};
 
 pub mod libvmaf;
 pub mod y4m;
@@ -22,7 +22,7 @@ mod gst {
         }
     }
     impl<R: std::io::Read + std::io::Seek + Send + Sync + 'static> super::PictureStream for PictureStream<R> {
-        fn next_pic(&mut self) -> Option<Result<super::Picture, super::Error>> {
+        fn next_pic(&mut self) -> Result<Option<super::Picture>, super::Error> {
             panic!("need gst feature");
         }
     }
@@ -70,13 +70,6 @@ impl fmt::Display for Error {
 
 impl error::Error for Error { }
 
-#[derive(Debug, Clone)]
-pub enum ModelVersion {
-    // TODO more versions
-    Version063B,
-    Path(PathBuf),
-}
-
 impl Into<libvmaf::ModelVersion> for ModelVersion {
     fn into(self) -> libvmaf::ModelVersion {
         match self {
@@ -104,6 +97,153 @@ fn liberr_converter(description: String) -> impl FnOnce(libvmaf::Error) -> Error
     }
 }
 
+
+#[derive(Debug)] 
+pub struct ScoreCollectorOpts {
+    pub log_level: LogLevel,
+    pub n_threads: usize,
+    pub n_subsample: usize,
+    pub cpumask: u64,
+}
+
+impl Default for ScoreCollectorOpts {
+    fn default() -> Self {
+        Self {
+            log_level: LogLevel::default(),
+            n_threads: 0,
+            n_subsample: 0,
+            cpumask: 0,
+        }
+    }
+}
+
+
+#[derive(Debug)]
+pub struct ScoreCollectorCollectScoreOpts {
+    pub pool_method: PoolingMethod,
+    pub output_path: Option<PathBuf>,
+    pub output_format: Option<OutputFormat>,
+}
+
+impl Default for ScoreCollectorCollectScoreOpts {
+    fn default() -> Self {
+        Self {
+            pool_method: PoolingMethod::default(),
+            output_path: None,
+            output_format: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ScoreCollector<Score> {
+    context: libvmaf::Context,
+    model: Model,
+    n_scores: AtomicUsize,
+    _marker: PhantomData<Score>,
+}
+
+impl<Score> ScoreCollector<Score> {
+    fn new_impl(model: Model, opts: ScoreCollectorOpts) -> Result<Self, Error> {
+        let cfg = libvmaf::Configuration::builder()
+            .log_level(opts.log_level)
+            .n_threads(opts.n_threads)
+            .n_subsample(opts.n_subsample)
+            .cpumask(opts.cpumask)
+            .build().map_err(liberr!("Failed to build libvmaf Context Configuration"))?;
+
+        let context = libvmaf::Context::new(cfg).map_err(liberr!("Failed to build libvmaf context"))?;
+        let n_scores = AtomicUsize::new(0);
+
+        Ok(Self { context, model, n_scores, _marker: PhantomData })
+    }
+
+    pub fn read_pictures(&mut self, ref_pic: Picture, dist_pic: Picture) -> Result<(), Error> {
+        let index = self.next_index();
+        self.context.read_pictures(ref_pic.picture, dist_pic.picture, index).map_err(liberr!("Failed to read pictures"))
+    }
+
+    pub fn n_scores(&self) -> usize {
+        self.n_scores.load(Ordering::Acquire)
+    }
+
+    fn write_score_if_needed(&self, output_path: Option<PathBuf>, output_format: Option<OutputFormat>) -> Result<(), Error> {
+        if (output_path.as_ref(), output_format) != (None, None) {
+            let (output_path, output_format) = match (output_path.clone(), output_format) {
+                (Some(output_path), Some(output_format)) => (output_path, output_format),
+                (Some(output_path), None) => {
+                    let output_format = OutputFormat::from_path(&output_path);
+                    (output_path, output_format)
+                },
+                (None, Some(output_format)) => (output_format.default_path(), output_format),
+                (None, None) => unreachable!(),
+            };
+            self.context.write_score_to_path(&output_path, output_format).map_err(liberr!("Failed to write vmaf scores to file: {:?}", output_path))?;
+        }
+        Ok(())
+    }
+
+    fn next_index(&mut self) -> usize {
+        let mut n_scores = self.n_scores.load(Ordering::Relaxed);
+        loop {
+            let next_n_scores = n_scores + 1;
+            match self.n_scores.compare_exchange_weak(n_scores, next_n_scores, Ordering::SeqCst, Ordering::Relaxed) {
+                Ok(_) => break n_scores,
+                Err(next_n_scores) => {
+                    n_scores = next_n_scores;
+                },
+            }
+        }
+    }
+}
+
+impl ScoreCollector<f64> {
+    pub fn new(model: Model, opts: ScoreCollectorOpts) -> Result<Self, Error> {
+        let mut collector = Self::new_impl(model, opts)?;
+        collector.context.use_simple_model_feature(&collector.model.model).map_err(liberr!("Failed to set model feature to use"))?;
+        Ok(collector)
+    }
+
+    pub fn collect_score(&self, opts: ScoreCollectorCollectScoreOpts) -> Result<f64, Error> {
+        let score = self.context.pooled_score(
+            &self.model.model,
+            opts.pool_method,
+            0, self.n_scores()
+        ).map_err(liberr!("Failed to pool bootstrapped score"))?;
+
+        self.write_score_if_needed(opts.output_path, opts.output_format)?;
+
+        Ok(score)
+    }
+}
+
+impl ScoreCollector<BootstrappedScore> {
+    pub fn new(model: Model, opts: ScoreCollectorOpts) -> Result<Self, Error> {
+        let mut collector = Self::new_impl(model, opts)?;
+        collector.context.use_collection_model_feature(&collector.model.model).map_err(liberr!("Failed to set model feature to use"))?;
+        Ok(collector)
+    }
+
+    pub fn collect_score(&self, opts: ScoreCollectorCollectScoreOpts) -> Result<BootstrappedScore, Error> {
+        let score = self.context.pooled_bootstrapped_score(
+            &self.model.model,
+            opts.pool_method,
+            0, self.n_scores()
+        ).map_err(liberr!("Failed to pool bootstrapped score"))?;
+
+        self.write_score_if_needed(opts.output_path, opts.output_format)?;
+
+        Ok(score)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ModelVersion {
+    // TODO more versions
+    Version063B,
+    Path(PathBuf),
+}
+
 #[derive(Debug)]
 pub struct ModelOpts {
     pub flags: ModelFlags,
@@ -120,6 +260,35 @@ impl Default for ModelOpts {
         }
     }
 }
+
+
+#[derive(Debug)]
+pub struct ModelCollectScoreOpts {
+    pub log_level: LogLevel,
+    pub n_threads: usize,
+    pub n_subsample: usize,
+    pub cpumask: u64,
+    pub pool_method: PoolingMethod,
+    pub output_path: Option<PathBuf>,
+    pub output_format: Option<OutputFormat>,
+}
+
+impl Default for ModelCollectScoreOpts {
+    fn default() -> Self {
+        let score_collector_opts = ScoreCollectorOpts::default();
+        let collect_score_opts = ScoreCollectorCollectScoreOpts::default();
+        Self {
+            log_level: score_collector_opts.log_level,
+            n_threads: score_collector_opts.n_threads,
+            n_subsample: score_collector_opts.n_subsample,
+            cpumask: score_collector_opts.cpumask,
+            pool_method: collect_score_opts.pool_method,
+            output_path: collect_score_opts.output_path,
+            output_format: collect_score_opts.output_format,
+        }
+    }
+}
+
 
 #[derive(Debug)]
 pub struct Model {
@@ -213,9 +382,7 @@ impl Model {
         feature_setter(&mut ctx, self).map_err(liberr!("Failed to use model feature"))?;
 
         let mut index = 0;
-        while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic(), dist_stream.next_pic()) {
-            let ref_pic = ref_pic?;
-            let dist_pic = dist_pic?;
+        while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic()?, dist_stream.next_pic()?) {
             ctx.read_pictures(ref_pic.picture, dist_pic.picture, index).map_err(liberr!("Failed to read pictures"))?;
             index += 1;
         }
@@ -261,10 +428,24 @@ pub struct CollectScoreOpts {
 }
 
 impl CollectScoreOpts {
-    pub fn into_devided(self) -> (ModelOpts, ModelCollectScoreOpts) {
+    pub fn into_score_collector_opts(self) -> (ModelOpts, ScoreCollectorOpts, ScoreCollectorCollectScoreOpts) {
         let Self { 
             model_flags, model_version, model_name_to_override,
-            log_level, n_threads, n_subsample, cpumask, pool_method, output_path, output_format,
+            log_level, n_threads, n_subsample, cpumask,
+            pool_method, output_path, output_format,
+        } = self;
+        (
+            ModelOpts { flags: model_flags, version: model_version, name_to_override: model_name_to_override },
+            ScoreCollectorOpts { log_level, n_threads, n_subsample, cpumask },
+            ScoreCollectorCollectScoreOpts { pool_method, output_path, output_format },
+        )
+    }
+
+    pub fn into_model_opts(self) -> (ModelOpts, ModelCollectScoreOpts) {
+        let Self { 
+            model_flags, model_version, model_name_to_override,
+            log_level, n_threads, n_subsample, cpumask,
+            pool_method, output_path, output_format,
         } = self;
         (
             ModelOpts { flags: model_flags, version: model_version, name_to_override: model_name_to_override },
@@ -276,15 +457,16 @@ impl CollectScoreOpts {
 impl Default for CollectScoreOpts {
     fn default() -> Self {
         let model_opts = ModelOpts::default();
-        let collect_score_opts = ModelCollectScoreOpts::default();
+        let score_collector_opts = ScoreCollectorOpts::default();
+        let collect_score_opts = ScoreCollectorCollectScoreOpts::default();
         Self {
             model_flags: model_opts.flags,
             model_version: model_opts.version,
             model_name_to_override: model_opts.name_to_override,
-            log_level: collect_score_opts.log_level,
-            n_threads: collect_score_opts.n_threads,
-            n_subsample: collect_score_opts.n_subsample,
-            cpumask: collect_score_opts.cpumask,
+            log_level: score_collector_opts.log_level,
+            n_threads: score_collector_opts.n_threads,
+            n_subsample: score_collector_opts.n_subsample,
+            cpumask: score_collector_opts.cpumask,
             pool_method: collect_score_opts.pool_method,
             output_path: collect_score_opts.output_path,
             output_format: collect_score_opts.output_format,
@@ -300,7 +482,7 @@ pub fn collect_score(ref_path: impl TryInto<AutoPictureStream, Error=Error>, dis
 }
 
 pub fn collect_score_from_stream_pair(ref_stream: impl PictureStream, dist_stream: impl PictureStream, opts: CollectScoreOpts) -> Result<f64, Error> {
-    let (model_opts, collect_score_opts) = opts.into_devided();
+    let (model_opts, collect_score_opts) = opts.into_model_opts();
 
     let model = Model::new(model_opts)?;
     model.collect_score_from_stream_pair(ref_stream, dist_stream, collect_score_opts)
@@ -314,35 +496,10 @@ pub fn collect_bootstrapped_score(ref_path: impl TryInto<AutoPictureStream, Erro
 }
 
 pub fn collect_bootstrapped_score_from_stream_pair(ref_stream: impl PictureStream, dist_stream: impl PictureStream, opts: CollectScoreOpts) -> Result<BootstrappedScore, Error> {
-    let (model_opts, collect_score_opts) = opts.into_devided();
+    let (model_opts, collect_score_opts) = opts.into_model_opts();
 
     let model = Model::new(model_opts)?;
     model.collect_bootstrapped_score_from_stream_pair(ref_stream, dist_stream, collect_score_opts)
-}
-
-#[derive(Debug)] 
-pub struct ModelCollectScoreOpts {
-    pub log_level: LogLevel,
-    pub n_threads: usize,
-    pub n_subsample: usize,
-    pub cpumask: u64,
-    pub pool_method: PoolingMethod,
-    pub output_path: Option<PathBuf>,
-    pub output_format: Option<OutputFormat>,
-}
-
-impl Default for ModelCollectScoreOpts {
-    fn default() -> Self {
-        Self {
-            log_level: LogLevel::default(),
-            n_threads: 0,
-            n_subsample: 0,
-            cpumask: 0,
-            pool_method: PoolingMethod::default(),
-            output_path: None,
-            output_format: None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -358,7 +515,7 @@ impl Picture {
 }
 
 pub trait PictureStream {
-    fn next_pic(&mut self) -> Option<Result<Picture, Error>>;
+    fn next_pic(&mut self) -> Result<Option<Picture>, Error>;
 }
 
 pub enum AutoPictureStream {
@@ -368,7 +525,7 @@ pub enum AutoPictureStream {
 }
 
 impl PictureStream for AutoPictureStream {
-    fn next_pic(&mut self) -> Option<Result<Picture, Error>> {
+    fn next_pic(&mut self) -> Result<Option<Picture>, Error> {
         match self {
             Self::Y4m(stream) => stream.next_pic(),
             Self::Gstreamer(stream) => stream.next_pic(),

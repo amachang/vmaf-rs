@@ -25,3 +25,6 @@ gst = ["glib", "gstreamer", "gstreamer-video", "gstreamer-app"]
 float = ["libvmaf-sys/float"]
 avx512 = ["libvmaf-sys/avx512"]
 
+[dev-dependencies]
+clap = { version = "4.4.7", features = ["derive"] }
+
