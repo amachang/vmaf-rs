@@ -237,12 +237,18 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for Pi
             return Ok(None);
         };
 
-        if data.appsink.is_eos() {
-            self.destroy_pipeline_if_needed();
-            return Ok(None);
-        }
+        let sample: gst::Sample = match data.appsink.pull_sample() {
+            Err(err) => {
+                if data.appsink.is_eos() {
+                    self.destroy_pipeline_if_needed();
+                    return Ok(None);
+                } else {
+                    return Err(crate::Error::from(Error::from(err)));
+                }
+            },
+            Ok(sample) => sample,
+        };
 
-        let sample: gst::Sample = data.appsink.pull_sample().map_err(Error::from)?;
         let caps = sample.caps().unwrap();
         let buffer = sample.buffer().unwrap();
         let info = gst_video::VideoInfo::from_caps(caps).map_err(Error::from)?;
@@ -310,6 +316,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                     ])
                     .build()
             )
+            .sync(false)
             .build();
 
         pipeline.add_many([&appsrc.upcast_ref(), &decodebin, &appsink.upcast_ref()])?;

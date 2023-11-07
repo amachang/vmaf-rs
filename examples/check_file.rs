@@ -19,10 +19,13 @@ fn main() -> Result<(), Box<dyn error::Error>>{
         .with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
         .progress_chars("#>-"));
 
+    let started_at = Instant::now();
+
+    let mut pic_count = 0;
     let progress_update_interval = Duration::from_millis(100);
     let mut progress_updated_at = Instant::now();
 
-    while let Some(pic) = stream.next_pic()? {
+    while let Some(_pic) = stream.next_pic()? {
         if progress_update_interval < progress_updated_at.elapsed() {
             if let (Some(pos), Some(dur)) = (stream.position_nanos(), stream.duration_nanos()) {
                 pb.set_length(dur);
@@ -30,8 +33,11 @@ fn main() -> Result<(), Box<dyn error::Error>>{
             }
             progress_updated_at = Instant::now();
         }
+        pic_count += 1;
     }
     pb.finish();
+
+    println!("Elapsed Time: {:?}, Picture Count: {}", started_at.elapsed(), pic_count);
 
     Ok(())
 }
