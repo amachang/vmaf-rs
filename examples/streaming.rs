@@ -19,16 +19,16 @@ fn main() -> Result<(), Box<dyn error::Error>>{
     let mut dist_stream = AutoPictureStream::from_path(args.dist_path)?;
     let mut score_collector = ScoreCollector::<BootstrappedScore>::new(Model::default(), ScoreCollectorOpts::default())?;
 
-    let collection_interval = 100;
+    let collection_interval = 300;
     while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic()?, dist_stream.next_pic()?) {
         score_collector.read_pictures(ref_pic, dist_pic)?;
-        let n_scores = score_collector.n_scores();
-        if n_scores % collection_interval == 0 {
-            let score = score_collector.collect_score(ScoreCollectorCollectScoreOpts::default())?;
-            println!("[{} Frames] Score: {:?}", n_scores, score);
+        if score_collector.n_scores() == collection_interval {
+            break
         }
     }
 
+    let score = score_collector.collect_score(ScoreCollectorCollectScoreOpts::default())?;
+    println!("[{} Frames] Score: {:?}", score_collector.n_scores(), score);
     Ok(())
 }
 

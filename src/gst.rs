@@ -334,6 +334,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
         let running_cond_pair = Arc::new((Mutex::new(false), Condvar::new()));
         let running_cond_pair_for_need_data = Arc::clone(&running_cond_pair);
         let running_cond_pair_for_enough_data = Arc::clone(&running_cond_pair);
+        let running_cond_pair_for_seek_data = Arc::clone(&running_cond_pair);
 
         let read_weak = Arc::downgrade(&read);
         let appsrc_weak = appsrc.downgrade();
@@ -362,11 +363,16 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                     let mut buffer_map = buffer_ref.map_writable().unwrap();
                     let buffer_slice = buffer_map.as_mut_slice();
                     let mut read = read.lock().unwrap();
-                    read.read(buffer_slice).unwrap()
+                    let size = read.read(buffer_slice).unwrap();
+                    size
                 };
                 if size == 0 {
                     appsrc.end_of_stream().unwrap();
-                    break;
+                    {
+                        let mut running_cond = running_cond.lock().unwrap();
+                        *running_cond = false;
+                        cvar.notify_all();
+                    }
                 } else {
                     buffer_ref.set_size(size);
                     appsrc.push_buffer(buffer).unwrap();
@@ -389,6 +395,8 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 cvar.notify_all();
             })
             .seek_data(move |_appsrc, offset| {
+                let (running_cond, cvar) = &*running_cond_pair_for_seek_data;
+
                 let Some(read) = read_weak_for_seek_data.upgrade() else {
                     return false
                 };
@@ -400,6 +408,13 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                     Err(_) => return false,
                     Ok(pos) => pos,
                 };
+
+                {
+                    let mut running_cond = running_cond.lock().unwrap();
+                    *running_cond = true;
+                    cvar.notify_all();
+                }
+
                 pos == offset
             })
             .build();
@@ -444,6 +459,26 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 }
             })
         });
+    }
+
+    pub fn duration_nanos(&self) -> Option<u64> {
+        let Some(ref data) = self.data else {
+            return None;
+        };
+        let Some(nanos) = data.pipeline.query_duration::<gst::format::ClockTime>() else {
+            return None;
+        };
+        Some(*nanos)
+    }
+
+    pub fn position_nanos(&self) -> Option<u64> {
+        let Some(ref data) = self.data else {
+            return None;
+        };
+        let Some(nanos) = data.pipeline.query_position::<gst::format::ClockTime>() else {
+            return None;
+        };
+        Some(*nanos)
     }
 
     fn destroy_pipeline_if_needed(&mut self) {

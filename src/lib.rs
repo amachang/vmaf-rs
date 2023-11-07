@@ -204,12 +204,13 @@ impl ScoreCollector<f64> {
         Ok(collector)
     }
 
-    pub fn collect_score(&self, opts: ScoreCollectorCollectScoreOpts) -> Result<f64, Error> {
+    pub fn collect_score(&mut self, opts: ScoreCollectorCollectScoreOpts) -> Result<f64, Error> {
+        self.context.wait_for_all_pictures_flushed().map_err(liberr!("Failed to flush scores"))?;
         let score = self.context.pooled_score(
             &self.model.model,
             opts.pool_method,
             0, self.n_scores()
-        ).map_err(liberr!("Failed to pool bootstrapped score"))?;
+        ).map_err(liberr!("Failed to pool score"))?;
 
         self.write_score_if_needed(opts.output_path, opts.output_format)?;
 
@@ -224,7 +225,8 @@ impl ScoreCollector<BootstrappedScore> {
         Ok(collector)
     }
 
-    pub fn collect_score(&self, opts: ScoreCollectorCollectScoreOpts) -> Result<BootstrappedScore, Error> {
+    pub fn collect_score(&mut self, opts: ScoreCollectorCollectScoreOpts) -> Result<BootstrappedScore, Error> {
+        self.context.wait_for_all_pictures_flushed().map_err(liberr!("Failed to flush scores"))?;
         let score = self.context.pooled_bootstrapped_score(
             &self.model.model,
             opts.pool_method,
@@ -307,104 +309,6 @@ impl Model {
 
         Ok(Self { model })
     }
-
-    pub fn collect_score(&self,
-        ref_path: impl TryInto<AutoPictureStream, Error=Error>,
-        dist_path: impl TryInto<AutoPictureStream, Error=Error>,
-        opts: ModelCollectScoreOpts,
-    ) -> Result<f64, Error> {
-        let ref_stream = ref_path.try_into()?;
-        let dist_stream = dist_path.try_into()?;
-
-        self.collect_score_from_stream_pair(ref_stream, dist_stream, opts)
-    }
-
-    pub fn collect_score_from_stream_pair(&self,
-        ref_stream: impl PictureStream,
-        dist_stream: impl PictureStream,
-        opts: ModelCollectScoreOpts,
-    ) -> Result<f64, Error> {
-        let feature_setter = |ctx: &mut libvmaf::Context, model: &Self| {
-            ctx.use_simple_model_feature(&model.model)
-        };
-        let pooler = |ctx: &libvmaf::Context, model: &Self, pool_method: PoolingMethod, start_index: usize, end_index: usize| {
-            ctx.pooled_score(&model.model, pool_method, start_index, end_index)
-        };
-
-        self.collect_score_impl(feature_setter, pooler, ref_stream, dist_stream, opts)
-    }
-
-    pub fn collect_bootstrapped_score(&self,
-        ref_path: impl TryInto<AutoPictureStream, Error=Error>,
-        dist_path: impl TryInto<AutoPictureStream, Error=Error>,
-        opts: ModelCollectScoreOpts,
-    ) -> Result<BootstrappedScore, Error> {
-        let ref_stream = ref_path.try_into()?;
-        let dist_stream = dist_path.try_into()?;
-
-        self.collect_bootstrapped_score_from_stream_pair(ref_stream, dist_stream, opts)
-    }
-
-    pub fn collect_bootstrapped_score_from_stream_pair(&self,
-        ref_stream: impl PictureStream,
-        dist_stream: impl PictureStream,
-        opts: ModelCollectScoreOpts,
-    ) -> Result<BootstrappedScore, Error> {
-        let feature_setter = |ctx: &mut libvmaf::Context, model: &Self| {
-            ctx.use_collection_model_feature(&model.model)
-        };
-        let pooler = |ctx: &libvmaf::Context, model: &Self, pool_method: PoolingMethod, start_index: usize, end_index: usize| {
-            ctx.pooled_bootstrapped_score(&model.model, pool_method, start_index, end_index)
-        };
-
-        self.collect_score_impl(feature_setter, pooler, ref_stream, dist_stream, opts)
-    }
-
-    fn collect_score_impl<FeatureSetterFn, PoolerFn, Score>(&self,
-        feature_setter: FeatureSetterFn,
-        pooler: PoolerFn,
-        mut ref_stream: impl PictureStream,
-        mut dist_stream: impl PictureStream,
-        opts: ModelCollectScoreOpts,
-    ) -> Result<Score, Error>
-        where
-            FeatureSetterFn: FnOnce(&mut libvmaf::Context, &Self) -> Result<(), libvmaf::Error>,
-            PoolerFn: FnOnce(&libvmaf::Context, &Self, PoolingMethod, usize, usize) -> Result<Score, libvmaf::Error>,
-    {
-        let cfg = libvmaf::Configuration::builder()
-            .log_level(opts.log_level)
-            .n_threads(opts.n_threads)
-            .n_subsample(opts.n_subsample)
-            .cpumask(opts.cpumask)
-            .build().map_err(liberr!("Failed to build Configuration"))?;
-
-        let mut ctx = libvmaf::Context::new(cfg).map_err(liberr!("Failed to build libvmaf context"))?;
-        feature_setter(&mut ctx, self).map_err(liberr!("Failed to use model feature"))?;
-
-        let mut index = 0;
-        while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic()?, dist_stream.next_pic()?) {
-            ctx.read_pictures(ref_pic.picture, dist_pic.picture, index).map_err(liberr!("Failed to read pictures"))?;
-            index += 1;
-        }
-
-        ctx.wait_for_all_pictures_flushed().map_err(liberr!("Failed to flush scores"))?;
-        let score = pooler(&ctx, self, opts.pool_method, 0, index).map_err(liberr!("Failed to pool scores"))?;
-
-        if (opts.output_path.as_ref(), opts.output_format) != (None, None) {
-            let (output_path, output_format) = match (opts.output_path.clone(), opts.output_format) {
-                (Some(output_path), Some(output_format)) => (output_path, output_format),
-                (Some(output_path), None) => {
-                    let output_format = OutputFormat::from_path(&output_path);
-                    (output_path, output_format)
-                },
-                (None, Some(output_format)) => (output_format.default_path(), output_format),
-                (None, None) => unreachable!(),
-            };
-            ctx.write_score_to_path(&output_path, output_format).map_err(liberr!("Failed to write vmaf scores to file: {:?}", output_path))?
-        }
-
-        Ok(score)
-    }
 }
 
 impl Default for Model {
@@ -481,11 +385,15 @@ pub fn collect_score(ref_path: impl TryInto<AutoPictureStream, Error=Error>, dis
     collect_score_from_stream_pair(ref_stream, dist_stream, opts)
 }
 
-pub fn collect_score_from_stream_pair(ref_stream: impl PictureStream, dist_stream: impl PictureStream, opts: CollectScoreOpts) -> Result<f64, Error> {
-    let (model_opts, collect_score_opts) = opts.into_model_opts();
-
+pub fn collect_score_from_stream_pair(mut ref_stream: impl PictureStream, mut dist_stream: impl PictureStream, opts: CollectScoreOpts) -> Result<f64, Error> {
+    let (model_opts, score_collector_opts, collect_score_opts) = opts.into_score_collector_opts();
     let model = Model::new(model_opts)?;
-    model.collect_score_from_stream_pair(ref_stream, dist_stream, collect_score_opts)
+    let mut score_collector = ScoreCollector::<f64>::new(model, score_collector_opts)?;
+
+    while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic()?, dist_stream.next_pic()?) {
+        score_collector.read_pictures(ref_pic, dist_pic)?;
+    }
+    score_collector.collect_score(collect_score_opts)
 }
 
 pub fn collect_bootstrapped_score(ref_path: impl TryInto<AutoPictureStream, Error=Error>, dist_path: impl TryInto<AutoPictureStream, Error=Error>, opts: CollectScoreOpts) -> Result<BootstrappedScore, Error> {
@@ -495,11 +403,15 @@ pub fn collect_bootstrapped_score(ref_path: impl TryInto<AutoPictureStream, Erro
     collect_bootstrapped_score_from_stream_pair(ref_stream, dist_stream, opts)
 }
 
-pub fn collect_bootstrapped_score_from_stream_pair(ref_stream: impl PictureStream, dist_stream: impl PictureStream, opts: CollectScoreOpts) -> Result<BootstrappedScore, Error> {
-    let (model_opts, collect_score_opts) = opts.into_model_opts();
-
+pub fn collect_bootstrapped_score_from_stream_pair(mut ref_stream: impl PictureStream, mut dist_stream: impl PictureStream, opts: CollectScoreOpts) -> Result<BootstrappedScore, Error> {
+    let (model_opts, score_collector_opts, collect_score_opts) = opts.into_score_collector_opts();
     let model = Model::new(model_opts)?;
-    model.collect_bootstrapped_score_from_stream_pair(ref_stream, dist_stream, collect_score_opts)
+    let mut score_collector = ScoreCollector::<BootstrappedScore>::new(model, score_collector_opts)?;
+
+    while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic()?, dist_stream.next_pic()?) {
+        score_collector.read_pictures(ref_pic, dist_pic)?;
+    }
+    score_collector.collect_score(collect_score_opts)
 }
 
 #[derive(Debug)]

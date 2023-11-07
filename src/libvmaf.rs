@@ -1167,7 +1167,6 @@ impl Picture {
 
             let src_data = frame_component.data().as_ptr() as *const u8;
             let dst_data = ptr.data[component_index] as *mut u8;
-
             for y in 0..component_height {
                 let n_copy_bytes = component_width * pixel_stride;
                 let src_offset = y * src_row_stride;
