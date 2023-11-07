@@ -8,11 +8,31 @@ use vmaf::*;
 struct Args {
     #[arg()]
     path: PathBuf,
+
+    #[arg(short, long)]
+    start_sec: Option<f64>,
+
+    #[arg(short, long)]
+    duration_sec: Option<f64>,
 }
 
-fn main() -> Result<(), Box<dyn error::Error>>{
+fn main() -> Result<(), Box<dyn error::Error>> {
     let args = Args::parse();
-    let mut stream = gst::PictureStream::from_path(args.path, false)?;
+    let start_position_nanos = if let Some(s) = args.start_sec {
+        Some((s * 1000_000_000.0).trunc() as u64)
+    } else {
+        None
+    };
+    let duration_nanos = if let Some(s) = args.duration_sec {
+        Some((s * 1000_000_000.0).trunc() as u64)
+    } else {
+        None
+    };
+    let mut stream = gst::PictureStream::from_path(args.path, gst::PictureStreamOpts {
+        start_position_nanos,
+        duration_nanos,
+        ..Default::default()
+    })?;
 
     let pb = ProgressBar::new(0);
     pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% (ETA: {eta})")?

@@ -17,7 +17,7 @@ mod gst {
         _marker: std::marker::PhantomData<R>,
     }
     impl PictureStream<std::io::BufReader<std::fs::File>>  {
-        pub fn from_path(_path: impl AsRef<std::path::Path>, _hwaccel: bool) -> Result<Self, super::Error> {
+        pub fn from_path(_path: impl AsRef<std::path::Path>, _opts: gst::PictureStreamOpts) -> Result<Self, super::Error> {
             panic!("need gst feature");
         }
     }
@@ -454,7 +454,7 @@ impl AutoPictureStream {
             Some(ext) => match ext.to_str() {
                 Some("y4m") => Ok(Self::Y4m(y4m::PictureStream::from_path(path)?)),
                 _ => if gst::supported() {
-                    Ok(Self::Gstreamer(gst::PictureStream::from_path(path, false)?))
+                    Ok(Self::Gstreamer(gst::PictureStream::from_path(path, gst::PictureStreamOpts::default())?))
                 } else {
                     Err(Error::UnsupportedVideoFile(format!("{:?}", path)))
                 },

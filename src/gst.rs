@@ -1,4 +1,4 @@
-use std::{fmt, error, io::{self, BufReader}, fs::File, path::Path, sync::{Arc, Mutex, Weak, Once, Condvar}, thread, num::TryFromIntError};
+use std::{fmt, error, io::{self, BufReader}, fs::File, path::Path, sync::{Arc, Mutex, Once, Condvar}, thread, num::TryFromIntError};
 use crate::{PixelFormat, Picture};
 use gstreamer as gst;
 use gstreamer_video as gst_video;
@@ -16,6 +16,8 @@ pub enum Error {
     GlibError(String),
     StateChangeError(String),
     FailedConversionInteger(String),
+    FailedToGetBusFromPipeline,
+    ReceivedErrorMessageFromBus(String),
     IoError(io::Error),
 }
 
@@ -45,48 +47,14 @@ impl fmt::Display for Error {
 
 impl error::Error for Error { }
 
-
-#[derive(Debug)]
-struct Gst;
-
-impl Gst {
-    fn new() -> Self {
-        gst::init().unwrap();
-        Self
-    }
-}
-
-impl Drop for Gst {
-    fn drop(&mut self) {
-        unsafe { gst::deinit() };
-    }
-}
-
-#[derive(Debug)]
-struct GstRefCounter {
-    gst: Weak<Gst>,
-}
-
-impl GstRefCounter {
-    fn new() -> Self {
-        Self {
-            gst: Weak::new(),
-        }
-    }
-
-    fn refer(&mut self) -> Arc<Gst> {
-        if let Some(gst) = self.gst.upgrade() {
-            gst
-        } else {
-            let gst = Arc::new(Gst::new());
-            self.gst = Arc::downgrade(&gst);
-            gst
-        }
-    }
-}
-
 lazy_static! {
-    static ref GST_REF_COUNTER: Mutex<GstRefCounter> = Mutex::new(GstRefCounter::new());
+    static ref INIT_ONCE: Once = Once::new();
+}
+
+fn init_if_needed() {
+    INIT_ONCE.call_once(|| {
+        let _ = gst::init();
+    });
 }
 
 #[derive(Debug)]
@@ -219,16 +187,54 @@ impl<'data> Frame<'data> {
 }
 
 #[derive(Debug)]
+pub struct PictureStreamOpts {
+    pub allow_hwaccel: bool,
+    pub start_position_nanos: Option<u64>,
+    pub duration_nanos: Option<u64>,
+}
+
+impl Default for PictureStreamOpts {
+    fn default() -> Self {
+        Self {
+            allow_hwaccel: false,
+            start_position_nanos: None,
+            duration_nanos: None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct PictureStream<R: io::Read + io::Seek + Send + Sync + 'static> {
-    _gst: Arc<Gst>,
     data: Option<PictureStreamData<R>>,
 }
 
 #[derive(Debug)]
 struct PictureStreamData<R: io::Read + io::Seek + Send + Sync + 'static> {
     pipeline: gst::Pipeline,
+    bus: gst::Bus,
     appsink: gst_app::AppSink,
-    _read: Arc<Mutex<R>>,
+    reader_thread_data: Arc<(Mutex<PictureStreamReaderThreadData<R>>, Condvar)>,
+}
+
+impl<R: io::Read + io::Seek + Send + Sync + 'static> Drop for PictureStreamData<R> {
+    fn drop(&mut self) {
+        {
+            let (reader_thread_data, cvar) = &*self.reader_thread_data;
+            let mut reader_thread_data = reader_thread_data.lock().unwrap();
+            reader_thread_data.dead = true;
+            cvar.notify_all();
+        }
+        // ignore error
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+#[derive(Debug)]
+struct PictureStreamReaderThreadData<R: io::Read + io::Seek + Send + Sync + 'static> {
+    read: R,
+    needs_data: bool,
+    no_more_data: bool,
+    dead: bool,
 }
 
 impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for PictureStream<R> {
@@ -237,13 +243,27 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for Pi
             return Ok(None);
         };
 
-        let sample: gst::Sample = match data.appsink.pull_sample() {
+        if let Some(result) = self.playback_result() {
+            return match result {
+                Ok(()) => Ok(None),
+                Err(err) => Err(crate::Error::from(err)),
+            };
+        };
+        let sample_result = data.appsink.pull_sample();
+        if let Some(result) = self.playback_result() {
+            return match result {
+                Ok(()) => Ok(None),
+                Err(err) => Err(crate::Error::from(err)),
+            };
+        };
+
+        let sample = match sample_result {
             Err(err) => {
-                if data.appsink.is_eos() {
-                    self.destroy_pipeline_if_needed();
-                    return Ok(None);
+                // sometimes pulled before bus eos message
+                return if data.appsink.is_eos() {
+                    Ok(None)
                 } else {
-                    return Err(crate::Error::from(Error::from(err)));
+                    Err(crate::Error::from(Error::from(err)))
                 }
             },
             Ok(sample) => sample,
@@ -260,19 +280,15 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for Pi
 }
 
 impl PictureStream<BufReader<File>> {
-    pub fn from_path(path: impl AsRef<Path>, allow_hwaccel: bool) -> Result<Self, Error> {
+    pub fn from_path(path: impl AsRef<Path>, opts: PictureStreamOpts) -> Result<Self, Error> {
         let read = BufReader::new(File::open(path)?);
-        Self::new(read, allow_hwaccel)
+        Self::new(read, opts)
     }
 }
 
 impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
-    pub fn new(mut read: R, allow_hwaccel: bool) -> Result<Self, Error> {
-        let gst = {
-            let mut lock = GST_REF_COUNTER.lock().unwrap();
-            lock.refer()
-        };
-
+    pub fn new(mut read: R, opts: PictureStreamOpts) -> Result<Self, Error> {
+        init_if_needed();
         let pipeline = gst::Pipeline::default();
 
         // TODO impl From<io::Error>
@@ -296,7 +312,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
             .build();
 
         let decodebin = gst::ElementFactory::make("decodebin")
-            .property("force-sw-decoders", !allow_hwaccel)
+            .property("force-sw-decoders", !opts.allow_hwaccel)
             .build()?;
 
         let appsink = gst_app::AppSink::builder()
@@ -324,41 +340,104 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
 
         Self::setup_docedbin_connection(&pipeline, &decodebin, &appsink);
 
-        let read = Arc::new(Mutex::new(read));
-        Self::setup_appsrc_stream_connection(appsrc, read.clone());
+        let reader_thread_data = Arc::new(
+            (
+                Mutex::new(PictureStreamReaderThreadData {
+                    read,
+                    needs_data: false,
+                    no_more_data: false,
+                    dead: false,
+                }),
+                Condvar::new(),
+            )
+        );
+        Self::setup_reader_thread(appsrc, reader_thread_data.clone());
 
-        pipeline.set_state(gst::State::Playing)?;
+        let bus = pipeline.bus().unwrap();
+
+        // PictureStreamData drop reader thread using RAII pattern
+        let data = PictureStreamData {
+            pipeline, bus, appsink, reader_thread_data,
+        };
+
+        // Wait for all element connected for seek;
+        let state_changed = data.pipeline.set_state(gst::State::Paused)?;
+        if state_changed == gst::StateChangeSuccess::Async {
+            let (result, state, pending_state) = data.pipeline.state(None);
+            let state_changed = result?;
+            assert_eq!(state_changed, gst::StateChangeSuccess::Success);
+            assert_eq!(pending_state, gst::State::VoidPending);
+            assert_eq!(state, gst::State::Paused);
+        }
+
+        match (opts.start_position_nanos, opts.duration_nanos) {
+            (None, None) => (),
+            (pos, dur) => {
+                let (start_type, start, stop_type, stop) = match (pos, dur) {
+                    (Some(pos), Some(dur)) => {
+                        (
+                            gst::SeekType::Set,
+                            gst::format::ClockTime::from_nseconds(pos),
+                            gst::SeekType::Set,
+                            gst::format::ClockTime::from_nseconds(pos + dur),
+                        )
+                    },
+                    (Some(pos), None) => {
+                        (
+                            gst::SeekType::Set,
+                            gst::format::ClockTime::from_nseconds(pos),
+                            gst::SeekType::End,
+                            gst::format::ClockTime::from_nseconds(0),
+                        )
+                    },
+                    (None, Some(dur)) => {
+                        (
+                            gst::SeekType::Set,
+                            gst::format::ClockTime::from_nseconds(0),
+                            gst::SeekType::Set,
+                            gst::format::ClockTime::from_nseconds(dur),
+                        )
+                    },
+                    (None, None) => unreachable!(),
+                };
+                data.pipeline.seek(
+                    1.0,
+                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                    start_type, start, stop_type, stop,
+                )?;
+            },
+        };
+
+        data.pipeline.set_state(gst::State::Playing)?;
 
         Ok(Self {
-            _gst: gst,
-            data: Some(PictureStreamData {
-                pipeline, appsink, _read: read,
-            }),
+            data: Some(data),
         })
     }
 
-    fn setup_appsrc_stream_connection(appsrc: gst_app::AppSrc, read: Arc<Mutex<R>>) {
-        let running_cond_pair = Arc::new((Mutex::new(false), Condvar::new()));
-        let running_cond_pair_for_need_data = Arc::clone(&running_cond_pair);
-        let running_cond_pair_for_enough_data = Arc::clone(&running_cond_pair);
-        let running_cond_pair_for_seek_data = Arc::clone(&running_cond_pair);
+    fn setup_reader_thread(appsrc: gst_app::AppSrc, data: Arc<(Mutex<PictureStreamReaderThreadData<R>>, Condvar)>) {
+        let data_for_need_data = Arc::clone(&data);
+        let data_for_enough_data = Arc::clone(&data);
+        let data_for_seek_data = Arc::clone(&data);
 
-        let read_weak = Arc::downgrade(&read);
         let appsrc_weak = appsrc.downgrade();
         thread::spawn(move || {
             // TODO error handling
-            let Some(read) = read_weak.upgrade() else {
-                return;
-            };
             let Some(appsrc) = appsrc_weak.upgrade() else {
                 return;
             };
-            loop {
-                let (running_cond, cvar) = &*running_cond_pair;
+            'thread_loop: loop {
                 {
-                    let mut running_cond = running_cond.lock().unwrap();
-                    while !*running_cond {
-                        running_cond = cvar.wait(running_cond).unwrap();
+                    let (data, cvar) = &*data;
+                    let mut data = data.lock().unwrap();
+                    loop {
+                        if data.dead {
+                            break 'thread_loop;
+                        }
+                        if data.needs_data && !data.no_more_data {
+                            break;
+                        }
+                        data = cvar.wait(data).unwrap();
                     }
                 }
 
@@ -369,59 +448,53 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 let size = {
                     let mut buffer_map = buffer_ref.map_writable().unwrap();
                     let buffer_slice = buffer_map.as_mut_slice();
-                    let mut read = read.lock().unwrap();
-                    let size = read.read(buffer_slice).unwrap();
+
+                    let (data, _) = &*data;
+                    let mut data = data.lock().unwrap();
+                    let size = data.read.read(buffer_slice).unwrap();
                     size
                 };
                 if size == 0 {
                     appsrc.end_of_stream().unwrap();
                     {
-                        let mut running_cond = running_cond.lock().unwrap();
-                        *running_cond = false;
+                        let (data, cvar) = &*data;
+                        let mut data = data.lock().unwrap();
+                        data.no_more_data = true;
                         cvar.notify_all();
                     }
                 } else {
                     buffer_ref.set_size(size);
-                    appsrc.push_buffer(buffer).unwrap();
+                    match appsrc.push_buffer(buffer) {
+                        Ok(_) => (),
+                        Err(gst::FlowError::Flushing) => (),
+                        Err(err) => panic!("Failed to push buffer: {:?}", err),
+                    }
                 };
             };
         });
 
-        let read_weak_for_seek_data = Arc::downgrade(&read);
         let callbacks = gst_app::AppSrcCallbacks::builder()
             .need_data(move |_appsrc, _size| {
-                let (running_cond, cvar) = &*running_cond_pair_for_need_data;
-                let mut running_cond = running_cond.lock().unwrap();
-                *running_cond = true;
+                let (data, cvar) = &*data_for_need_data;
+                let mut data = data.lock().unwrap();
+                data.needs_data = true;
                 cvar.notify_all();
             })
             .enough_data(move |_appsrc| {
-                let (running_cond, cvar) = &*running_cond_pair_for_enough_data;
-                let mut running_cond = running_cond.lock().unwrap();
-                *running_cond = false;
+                let (data, cvar) = &*data_for_enough_data;
+                let mut data = data.lock().unwrap();
+                data.needs_data = false;
                 cvar.notify_all();
             })
             .seek_data(move |_appsrc, offset| {
-                let (running_cond, cvar) = &*running_cond_pair_for_seek_data;
-
-                let Some(read) = read_weak_for_seek_data.upgrade() else {
-                    return false
-                };
-                let mut read = match read.lock() {
-                    Err(_) => return false,
-                    Ok(read) => read,
-                };
-                let pos = match read.seek(io::SeekFrom::Start(offset)) {
+                let (data, cvar) = &*data_for_seek_data;
+                let mut data = data.lock().unwrap();
+                let pos = match data.read.seek(io::SeekFrom::Start(offset)) {
                     Err(_) => return false,
                     Ok(pos) => pos,
                 };
-
-                {
-                    let mut running_cond = running_cond.lock().unwrap();
-                    *running_cond = true;
-                    cvar.notify_all();
-                }
-
+                data.no_more_data = false;
+                cvar.notify_all();
                 pos == offset
             })
             .build();
@@ -468,6 +541,19 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
         });
     }
 
+    fn playback_result(&self) -> Option<Result<(), Error>> {
+        let data = &self.data.as_ref().unwrap();
+
+        match data.bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos, gst::MessageType::SegmentDone]) {
+            Some(message) => match message.view() {
+                gst::MessageView::Error(err) => Some(Err(Error::ReceivedErrorMessageFromBus(format!("{}", err)))),
+                gst::MessageView::Eos(_) | gst::MessageView::SegmentDone(_) => Some(Ok(())),
+                _ => unreachable!(),
+            },
+            None => None,
+        }
+    }
+
     pub fn duration_nanos(&self) -> Option<u64> {
         let Some(ref data) = self.data else {
             return None;
@@ -487,20 +573,11 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
         };
         Some(*nanos)
     }
-
-    fn destroy_pipeline_if_needed(&mut self) {
-        let Some(data) = self.data.take() else {
-            return;
-        };
-
-        // ignore error
-        let _ = data.pipeline.set_state(gst::State::Null);
-    }
 }
 
 impl<R: io::Read + io::Seek + Send + Sync + 'static> Drop for PictureStream<R> {
     fn drop(&mut self) {
-        self.destroy_pipeline_if_needed();
+        self.data = None;
     }
 }
 
