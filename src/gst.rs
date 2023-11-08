@@ -266,7 +266,9 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for Pi
             while !sink_thread_data.dead && !sink_thread_data.eos && sink_thread_data.error_message.is_none() && sink_thread_data.new_sample.is_none() {
                 sink_thread_data = cvar.wait(sink_thread_data).unwrap();
             };
-            (sink_thread_data.eos, sink_thread_data.new_sample.take(), sink_thread_data.error_message.take())
+            let r = (sink_thread_data.eos, sink_thread_data.new_sample.take(), sink_thread_data.error_message.take());
+            cvar.notify_all();
+            r
         };
 
         if let Some(error_message) = error_message {
@@ -537,6 +539,9 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 };
                 let (data, cvar) = &*data;
                 let mut data = data.lock().unwrap();
+                while !data.dead && data.new_sample.is_some() {
+                    data = cvar.wait(data).unwrap();
+                }
                 data.eos = true;
                 cvar.notify_all();
             })
@@ -546,6 +551,9 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 };
                 let (data, cvar) = &*data;
                 let mut data = data.lock().unwrap();
+                while !data.dead && data.new_sample.is_some() {
+                    data = cvar.wait(data).unwrap();
+                }
                 data.new_sample = appsink.try_pull_sample(gst::ClockTime::ZERO);
                 cvar.notify_all();
                 Ok(gst::FlowSuccess::Ok)
