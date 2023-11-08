@@ -2,6 +2,7 @@ use std::{error, path::PathBuf, fmt::Write, time::{Duration, Instant}};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use vmaf::*;
+use gstreamer::ClockTime;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -18,21 +19,17 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn error::Error>> {
     let args = Args::parse();
-    let start_position_nanos = if let Some(s) = args.start_sec {
-        Some((s * 1000_000_000.0).trunc() as u64)
+    let start = if let Some(s) = args.start_sec {
+        Some(ClockTime::from_nseconds((s * 1000_000_000.0).trunc() as u64))
     } else {
         None
     };
-    let duration_nanos = if let Some(s) = args.duration_sec {
-        Some((s * 1000_000_000.0).trunc() as u64)
+    let duration = if let Some(d) = args.duration_sec {
+        Some(ClockTime::from_nseconds((d * 1000_000_000.0).trunc() as u64))
     } else {
         None
     };
-    let mut stream = gst::PictureStream::from_path(args.path, gst::PictureStreamOpts {
-        start_position_nanos,
-        duration_nanos,
-        ..Default::default()
-    })?;
+    let mut stream = gst::PictureStream::from_path(args.path, gst::PictureStreamOpts { start, duration, ..Default::default() })?;
 
     let pb = ProgressBar::new(0);
     pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% (ETA: {eta})")?

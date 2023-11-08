@@ -190,16 +190,16 @@ impl<'data> Frame<'data> {
 #[derive(Debug)]
 pub struct PictureStreamOpts {
     pub allow_hwaccel: bool,
-    pub start_position_nanos: Option<u64>,
-    pub duration_nanos: Option<u64>,
+    pub start: Option<gst::ClockTime>,
+    pub duration: Option<gst::ClockTime>,
 }
 
 impl Default for PictureStreamOpts {
     fn default() -> Self {
         Self {
             allow_hwaccel: false,
-            start_position_nanos: None,
-            duration_nanos: None,
+            start: None,
+            duration: None,
         }
     }
 }
@@ -362,7 +362,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
 
         let bus = pipeline.bus().unwrap();
 
-        let segment = match (opts.start_position_nanos, opts.duration_nanos) {
+        let segment = match (opts.start, opts.duration) {
             (None, None) => None,
             (pos, dur) => {
                 let mut segment = gst::Segment::new();
@@ -370,15 +370,15 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 segment.set_rate(1.0);
                 match (pos, dur) {
                     (Some(pos), Some(dur)) => {
-                        segment.set_start(gst::format::ClockTime::from_nseconds(pos));
-                        segment.set_stop(gst::format::ClockTime::from_nseconds(pos + dur));
+                        segment.set_start(pos);
+                        segment.set_stop(pos + dur);
                     },
                     (Some(pos), None) => {
-                        segment.set_start(gst::format::ClockTime::from_nseconds(pos));
+                        segment.set_start(pos);
                     },
                     (None, Some(dur)) => {
-                        segment.set_start(gst::format::ClockTime::from_nseconds(0));
-                        segment.set_stop(gst::format::ClockTime::from_nseconds(0 + dur));
+                        segment.set_start(gst::format::ClockTime::ZERO);
+                        segment.set_stop(dur);
                     },
                     (None, None) => unreachable!(),
                 };
