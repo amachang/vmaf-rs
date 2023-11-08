@@ -17,6 +17,7 @@ pub enum Error {
     StateChangeError(String),
     FailedConversionInteger(String),
     FailedToGetBusFromPipeline,
+    PictureStreamAlreadyDropped,
     ReceivedErrorMessageFromBus(String),
     IoError(io::Error),
 }
@@ -211,19 +212,27 @@ pub struct PictureStream<R: io::Read + io::Seek + Send + Sync + 'static> {
 #[derive(Debug)]
 struct PictureStreamData<R: io::Read + io::Seek + Send + Sync + 'static> {
     pipeline: gst::Pipeline,
-    bus: gst::Bus,
-    appsink: gst_app::AppSink,
+    _bus: gst::Bus,
     reader_thread_data: Arc<(Mutex<PictureStreamReaderThreadData<R>>, Condvar)>,
+    sink_thread_data: Arc<(Mutex<PictureStreamSinkThreadData>, Condvar)>,
 }
 
 impl<R: io::Read + io::Seek + Send + Sync + 'static> Drop for PictureStreamData<R> {
     fn drop(&mut self) {
+        {
+            let (sink_thread_data, cvar) = &*self.sink_thread_data;
+            let mut sink_thread_data = sink_thread_data.lock().unwrap();
+            sink_thread_data.dead = true;
+            cvar.notify_all();
+        }
+
         {
             let (reader_thread_data, cvar) = &*self.reader_thread_data;
             let mut reader_thread_data = reader_thread_data.lock().unwrap();
             reader_thread_data.dead = true;
             cvar.notify_all();
         }
+
         // ignore error
         let _ = self.pipeline.set_state(gst::State::Null);
     }
@@ -237,36 +246,39 @@ struct PictureStreamReaderThreadData<R: io::Read + io::Seek + Send + Sync + 'sta
     dead: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PictureStreamSinkThreadData {
+    error_message: Option<String>,
+    new_sample: Option<gst::Sample>,
+    eos: bool,
+    dead: bool,
+}
+
 impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for PictureStream<R> {
     fn next_pic(&mut self) -> Result<Option<Picture>, crate::Error> {
         let Some(data) = self.data.as_ref() else {
             return Ok(None);
         };
 
-        if let Some(result) = self.playback_result() {
-            return match result {
-                Ok(()) => Ok(None),
-                Err(err) => Err(crate::Error::from(err)),
+        let (sink_thread_data, cvar) = &*data.sink_thread_data;
+        let (eos, sample, error_message) = {
+            let mut sink_thread_data = sink_thread_data.lock().unwrap();
+            while !sink_thread_data.dead && !sink_thread_data.eos && sink_thread_data.error_message.is_none() && sink_thread_data.new_sample.is_none() {
+                sink_thread_data = cvar.wait(sink_thread_data).unwrap();
             };
-        };
-        let sample_result = data.appsink.pull_sample();
-        if let Some(result) = self.playback_result() {
-            return match result {
-                Ok(()) => Ok(None),
-                Err(err) => Err(crate::Error::from(err)),
-            };
+            (sink_thread_data.eos, sink_thread_data.new_sample.take(), sink_thread_data.error_message.take())
         };
 
-        let sample = match sample_result {
-            Err(err) => {
-                // sometimes pulled before bus eos message
-                return if data.appsink.is_eos() {
-                    Ok(None)
-                } else {
-                    Err(crate::Error::from(Error::from(err)))
-                }
-            },
-            Ok(sample) => sample,
+        if let Some(error_message) = error_message {
+            return Err(crate::Error::from(Error::ReceivedErrorMessageFromBus(error_message)));
+        };
+
+        if eos {
+            return Ok(None);
+        }
+
+        let Some(sample) = sample else {
+            return Err(crate::Error::from(Error::PictureStreamAlreadyDropped));
         };
 
         let caps = sample.caps().unwrap();
@@ -332,6 +344,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                     ])
                     .build()
             )
+
             .sync(false)
             .build();
 
@@ -341,23 +354,20 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
         Self::setup_docedbin_connection(&pipeline, &decodebin, &appsink);
 
         let reader_thread_data = Arc::new(
-            (
-                Mutex::new(PictureStreamReaderThreadData {
-                    read,
-                    needs_data: false,
-                    no_more_data: false,
-                    dead: false,
-                }),
-                Condvar::new(),
-            )
+            (Mutex::new(PictureStreamReaderThreadData { read, needs_data: false, no_more_data: false, dead: false }), Condvar::new())
         );
         Self::setup_reader_thread(appsrc, reader_thread_data.clone());
 
         let bus = pipeline.bus().unwrap();
 
+        let sink_thread_data = Arc::new(
+            (Mutex::new(PictureStreamSinkThreadData { error_message: None, new_sample: None, eos: false, dead: false }), Condvar::new())
+        );
+        Self::setup_sink_thread(appsink, &bus, sink_thread_data.clone());
+
         // PictureStreamData drop reader thread using RAII pattern
         let data = PictureStreamData {
-            pipeline, bus, appsink, reader_thread_data,
+            pipeline, _bus: bus, sink_thread_data, reader_thread_data,
         };
 
         // Wait for all element connected for seek;
@@ -402,7 +412,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 };
                 data.pipeline.seek(
                     1.0,
-                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE | gst::SeekFlags::SEGMENT,
                     start_type, start, stop_type, stop,
                 )?;
             },
@@ -501,6 +511,49 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
         appsrc.set_callbacks(callbacks);
     }
 
+    fn setup_sink_thread(appsink: gst_app::AppSink, bus: &gst::Bus, data: Arc<(Mutex<PictureStreamSinkThreadData>, Condvar)>) {
+        let data_weak = Arc::downgrade(&data);
+        bus.enable_sync_message_emission();
+        bus.connect_sync_message(Some("error"), move |_bus, message| {
+            let Some(data) = data_weak.upgrade() else {
+                return;
+            };
+            let gst::MessageView::Error(err) = message.view() else {
+                return;
+            };
+
+            let (data, cvar) = &*data;
+            let mut data = data.lock().unwrap();
+            data.error_message = Some(format!("{}", err));
+            cvar.notify_all();
+        });
+
+        let data_weak_for_eos = Arc::downgrade(&data);
+        let data_weak_for_new_sample = Arc::downgrade(&data);
+        let callbacks = gst_app::AppSinkCallbacks::builder()
+            .eos(move |_| {
+                let Some(data) = data_weak_for_eos.upgrade() else {
+                    return;
+                };
+                let (data, cvar) = &*data;
+                let mut data = data.lock().unwrap();
+                data.eos = true;
+                cvar.notify_all();
+            })
+            .new_sample(move |appsink| {
+                let Some(data) = data_weak_for_new_sample.upgrade() else {
+                    return Ok(gst::FlowSuccess::Ok);
+                };
+                let (data, cvar) = &*data;
+                let mut data = data.lock().unwrap();
+                data.new_sample = appsink.try_pull_sample(gst::ClockTime::ZERO);
+                cvar.notify_all();
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build();
+        appsink.set_callbacks(callbacks);
+    }
+
     fn setup_docedbin_connection(pipeline: &gst::Pipeline, decodebin: &gst::Element, appsink: &gst_app::AppSink) {
         let pipeline_weak = pipeline.downgrade();
         let appsink_weak = appsink.downgrade();
@@ -529,8 +582,10 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
 
                 let appsink_caps = appsink.caps().expect("must have a caps");
                 if appsink_caps.can_intersect(caps.as_ref()) {
+                    // just connect
                     src_pad.link(&appsink.static_pad("sink").expect("must have a static pad")).expect("must be able to connect");
                 } else {
+                    // insert videoconvert elemeent
                     let videoconvert = gst::ElementFactory::make("videoconvert").build().expect("Gstreamer videoconvert element must be installed");
                     pipeline.add(&videoconvert).expect("videoconvert must be abled to be added to pipeline");
                     gst::Element::link_many([&videoconvert, &appsink.upcast_ref()]).expect("videoconvert must be connected with any raw video caps");
@@ -539,19 +594,6 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 }
             })
         });
-    }
-
-    fn playback_result(&self) -> Option<Result<(), Error>> {
-        let data = &self.data.as_ref().unwrap();
-
-        match data.bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos, gst::MessageType::SegmentDone]) {
-            Some(message) => match message.view() {
-                gst::MessageView::Error(err) => Some(Err(Error::ReceivedErrorMessageFromBus(format!("{}", err)))),
-                gst::MessageView::Eos(_) | gst::MessageView::SegmentDone(_) => Some(Ok(())),
-                _ => unreachable!(),
-            },
-            None => None,
-        }
     }
 
     pub fn duration_nanos(&self) -> Option<u64> {
