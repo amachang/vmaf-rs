@@ -362,10 +362,35 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
 
         let bus = pipeline.bus().unwrap();
 
+        let segment = match (opts.start_position_nanos, opts.duration_nanos) {
+            (None, None) => None,
+            (pos, dur) => {
+                let mut segment = gst::Segment::new();
+                segment.set_format(gst::Format::Time);
+                segment.set_rate(1.0);
+                match (pos, dur) {
+                    (Some(pos), Some(dur)) => {
+                        segment.set_start(gst::format::ClockTime::from_nseconds(pos));
+                        segment.set_stop(gst::format::ClockTime::from_nseconds(pos + dur));
+                    },
+                    (Some(pos), None) => {
+                        segment.set_start(gst::format::ClockTime::from_nseconds(pos));
+                    },
+                    (None, Some(dur)) => {
+                        segment.set_start(gst::format::ClockTime::from_nseconds(0));
+                        segment.set_stop(gst::format::ClockTime::from_nseconds(0 + dur));
+                    },
+                    (None, None) => unreachable!(),
+                };
+                Some(segment)
+            },
+        };
+
+
         let sink_thread_data = Arc::new(
             (Mutex::new(PictureStreamSinkThreadData { error_message: None, new_sample: None, eos: false, dead: false }), Condvar::new())
         );
-        Self::setup_sink_thread(appsink, &bus, sink_thread_data.clone());
+        Self::setup_sink_thread(appsink, &bus, segment.clone(), sink_thread_data.clone());
 
         // PictureStreamData drop reader thread using RAII pattern
         let data = PictureStreamData {
@@ -382,42 +407,24 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
             assert_eq!(state, gst::State::Paused);
         }
 
-        match (opts.start_position_nanos, opts.duration_nanos) {
-            (None, None) => (),
-            (pos, dur) => {
-                let (start_type, start, stop_type, stop) = match (pos, dur) {
-                    (Some(pos), Some(dur)) => {
-                        (
-                            gst::SeekType::Set,
-                            gst::format::ClockTime::from_nseconds(pos),
-                            gst::SeekType::Set,
-                            gst::format::ClockTime::from_nseconds(pos + dur),
-                        )
-                    },
-                    (Some(pos), None) => {
-                        (
-                            gst::SeekType::Set,
-                            gst::format::ClockTime::from_nseconds(pos),
-                            gst::SeekType::End,
-                            gst::format::ClockTime::from_nseconds(0),
-                        )
-                    },
-                    (None, Some(dur)) => {
-                        (
-                            gst::SeekType::Set,
-                            gst::format::ClockTime::from_nseconds(0),
-                            gst::SeekType::Set,
-                            gst::format::ClockTime::from_nseconds(dur),
-                        )
-                    },
-                    (None, None) => unreachable!(),
-                };
-                data.pipeline.seek(
-                    1.0,
-                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE | gst::SeekFlags::SEGMENT,
-                    start_type, start, stop_type, stop,
-                )?;
-            },
+        if let Some(segment) = segment {
+            let start = segment.start();
+            let stop = segment.stop();
+
+            let gst::GenericFormattedValue::Time(Some(start)) = start else { unreachable!() };
+
+            let (stop_type, stop) = if stop.is_none() {
+                (gst::SeekType::None, gst::ClockTime::ZERO)
+            } else {
+                let gst::GenericFormattedValue::Time(Some(stop)) = stop else { unreachable!() };
+                (gst::SeekType::Set, stop)
+            };
+
+            data.pipeline.seek(
+                1.0,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::SeekType::Set, start, stop_type, stop,
+            )?;
         };
 
         data.pipeline.set_state(gst::State::Playing)?;
@@ -513,7 +520,8 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
         appsrc.set_callbacks(callbacks);
     }
 
-    fn setup_sink_thread(appsink: gst_app::AppSink, bus: &gst::Bus, data: Arc<(Mutex<PictureStreamSinkThreadData>, Condvar)>) {
+    // seek's stop parameter sometimes ignored by demuxer, so we manually do dropping samples out of segment.
+    fn setup_sink_thread(appsink: gst_app::AppSink, bus: &gst::Bus, segment: Option<gst::Segment>, data: Arc<(Mutex<PictureStreamSinkThreadData>, Condvar)>) {
         let data_weak = Arc::downgrade(&data);
         bus.enable_sync_message_emission();
         bus.connect_sync_message(Some("error"), move |_bus, message| {
@@ -539,7 +547,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 };
                 let (data, cvar) = &*data;
                 let mut data = data.lock().unwrap();
-                while !data.dead && data.new_sample.is_some() {
+                while !data.dead && !data.eos && data.new_sample.is_some() {
                     data = cvar.wait(data).unwrap();
                 }
                 data.eos = true;
@@ -551,10 +559,41 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 };
                 let (data, cvar) = &*data;
                 let mut data = data.lock().unwrap();
-                while !data.dead && data.new_sample.is_some() {
+                while !data.dead && !data.eos && data.new_sample.is_some() {
                     data = cvar.wait(data).unwrap();
                 }
-                data.new_sample = appsink.try_pull_sample(gst::ClockTime::ZERO);
+                if data.dead || data.eos {
+                    return Err(gst::FlowError::Eos);
+                };
+                let Some(new_sample) = appsink.try_pull_sample(gst::ClockTime::ZERO) else {
+                    return Ok(gst::FlowSuccess::Ok);
+                };
+
+                if let Some(segment) = &segment {
+                    let Some(buffer) = new_sample.buffer() else {
+                        return Err(gst::FlowError::NotSupported)
+                    };
+                    let Some(pts) = buffer.pts() else {
+                        return Err(gst::FlowError::NotSupported)
+                    };
+
+                    let gst::GenericFormattedValue::Time(Some(start)) = segment.start() else { unreachable!() };
+
+                    if start <= pts {
+                        if let gst::GenericFormattedValue::Time(Some(stop)) = segment.stop() {
+                            if pts < stop {
+                                data.new_sample = Some(new_sample);
+                            } else {
+                                data.eos = true;
+                            }
+                        } else {
+                            data.new_sample = Some(new_sample);
+                        }
+                    }
+                } else {
+                    data.new_sample = Some(new_sample);
+                };
+
                 cvar.notify_all();
                 Ok(gst::FlowSuccess::Ok)
             })
