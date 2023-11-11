@@ -18,7 +18,7 @@ pub enum Error {
     FailedConversionInteger(String),
     FailedToGetBusFromPipeline,
     PictureStreamAlreadyDropped,
-    ReceivedErrorMessageFromBus(String),
+    ReceivedErrorMessageFromSinkThread(String),
     IoError(io::Error),
 }
 
@@ -192,6 +192,7 @@ pub struct PictureStreamOpts {
     pub allow_hwaccel: bool,
     pub start: Option<gst::ClockTime>,
     pub duration: Option<gst::ClockTime>,
+    pub fps: Option<usize>,
 }
 
 impl Default for PictureStreamOpts {
@@ -200,6 +201,7 @@ impl Default for PictureStreamOpts {
             allow_hwaccel: false,
             start: None,
             duration: None,
+            fps: None,
         }
     }
 }
@@ -221,14 +223,14 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> Drop for PictureStreamData<
     fn drop(&mut self) {
         {
             let (sink_thread_data, cvar) = &*self.sink_thread_data;
-            let mut sink_thread_data = sink_thread_data.lock().unwrap();
+            let mut sink_thread_data = sink_thread_data.lock().expect("deny poisoned lock");
             sink_thread_data.dead = true;
             cvar.notify_all();
         }
 
         {
             let (reader_thread_data, cvar) = &*self.reader_thread_data;
-            let mut reader_thread_data = reader_thread_data.lock().unwrap();
+            let mut reader_thread_data = reader_thread_data.lock().expect("deny poisoned lock");
             reader_thread_data.dead = true;
             cvar.notify_all();
         }
@@ -248,6 +250,8 @@ struct PictureStreamReaderThreadData<R: io::Read + io::Seek + Send + Sync + 'sta
 
 #[derive(Debug, Clone)]
 struct PictureStreamSinkThreadData {
+    per_n_frames: Option<usize>,
+    n_pulled_frames: usize,
     error_message: Option<String>,
     new_sample: Option<gst::Sample>,
     eos: bool,
@@ -264,7 +268,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for Pi
         let (eos, sample, error_message) = {
             let mut sink_thread_data = sink_thread_data.lock().unwrap();
             while !sink_thread_data.dead && !sink_thread_data.eos && sink_thread_data.error_message.is_none() && sink_thread_data.new_sample.is_none() {
-                sink_thread_data = cvar.wait(sink_thread_data).unwrap();
+                sink_thread_data = cvar.wait(sink_thread_data).expect("deny poisoned lock");
             };
             let r = (sink_thread_data.eos, sink_thread_data.new_sample.take(), sink_thread_data.error_message.take());
             cvar.notify_all();
@@ -272,7 +276,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for Pi
         };
 
         if let Some(error_message) = error_message {
-            return Err(crate::Error::from(Error::ReceivedErrorMessageFromBus(error_message)));
+            return Err(crate::Error::from(Error::ReceivedErrorMessageFromSinkThread(error_message)));
         };
 
         if eos {
@@ -388,9 +392,9 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
 
 
         let sink_thread_data = Arc::new(
-            (Mutex::new(PictureStreamSinkThreadData { error_message: None, new_sample: None, eos: false, dead: false }), Condvar::new())
+            (Mutex::new(PictureStreamSinkThreadData { per_n_frames: None, n_pulled_frames: 0, error_message: None, new_sample: None, eos: false, dead: false }), Condvar::new())
         );
-        Self::setup_sink_thread(appsink, &bus, segment.clone(), sink_thread_data.clone());
+        Self::setup_sink_thread(appsink, &bus, segment.clone(), opts.fps, sink_thread_data.clone());
 
         // PictureStreamData drop reader thread using RAII pattern
         let data = PictureStreamData {
@@ -456,7 +460,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                         if data.needs_data && !data.no_more_data {
                             break;
                         }
-                        data = cvar.wait(data).unwrap();
+                        data = cvar.wait(data).expect("deny poisoned lock");
                     }
                 }
 
@@ -521,11 +525,58 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
     }
 
     // seek's stop parameter sometimes ignored by demuxer, so we manually do dropping samples out of segment.
-    fn setup_sink_thread(appsink: gst_app::AppSink, bus: &gst::Bus, segment: Option<gst::Segment>, data: Arc<(Mutex<PictureStreamSinkThreadData>, Condvar)>) {
-        let data_weak = Arc::downgrade(&data);
+    fn setup_sink_thread(appsink: gst_app::AppSink, bus: &gst::Bus, segment: Option<gst::Segment>, fps: Option<usize>, data: Arc<(Mutex<PictureStreamSinkThreadData>, Condvar)>) {
+        let data_weak_for_state_changed = Arc::downgrade(&data);
+        let data_weak_for_error = Arc::downgrade(&data);
         bus.enable_sync_message_emission();
+
+        if let Some(fps) = fps {
+            let appsink_weak = appsink.downgrade();
+            bus.connect_sync_message(Some("state-changed"), move |_bus, message| {
+                let Some(data) = data_weak_for_state_changed.upgrade() else {
+                    return;
+                };
+                let Some(appsink) = appsink_weak.upgrade() else {
+                    return;
+                };
+                if message.src().unwrap() != appsink.upcast_ref::<gst::Object>() {
+                    return;
+                };
+                let gst::MessageView::StateChanged(state_changed) = message.view() else {
+                    return;
+                };
+                if state_changed.current() != gst::State::Paused {
+                    return;
+                };
+                if state_changed.pending() != gst::State::VoidPending {
+                    return;
+                };
+
+                let (data, cvar) = &*data;
+                let mut data = data.lock().unwrap();
+
+                // TODO error handling
+                let sink_caps = appsink.static_pad("sink").unwrap().caps().unwrap();
+                let frame_rate = sink_caps.structure(0).unwrap().value("framerate").unwrap();
+                let frame_rate: gst::Fraction = unsafe { glib::value::FromValue::from_value(frame_rate) };
+                let numer = from_c_uint(frame_rate.numer()).unwrap();
+                let denom = from_c_uint(frame_rate.denom()).unwrap();
+                let per_n_frames = usize::max(numer.div_ceil(fps * denom), 1);
+
+                if let Some(current_per_n_frames) = data.per_n_frames {
+                    if current_per_n_frames != per_n_frames {
+                        data.error_message = Some(format!("Frame rate change not supported: {} -> {}", current_per_n_frames, per_n_frames));
+                    }
+                } else {
+                    data.per_n_frames = Some(per_n_frames);
+                };
+
+                cvar.notify_all();
+            });
+        }
+
         bus.connect_sync_message(Some("error"), move |_bus, message| {
-            let Some(data) = data_weak.upgrade() else {
+            let Some(data) = data_weak_for_error.upgrade() else {
                 return;
             };
             let gst::MessageView::Error(err) = message.view() else {
@@ -548,7 +599,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 let (data, cvar) = &*data;
                 let mut data = data.lock().unwrap();
                 while !data.dead && !data.eos && data.new_sample.is_some() {
-                    data = cvar.wait(data).unwrap();
+                    data = cvar.wait(data).expect("deny poisoned lock");
                 }
                 data.eos = true;
                 cvar.notify_all();
@@ -560,7 +611,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                 let (data, cvar) = &*data;
                 let mut data = data.lock().unwrap();
                 while !data.dead && !data.eos && data.new_sample.is_some() {
-                    data = cvar.wait(data).unwrap();
+                    data = cvar.wait(data).expect("deny poisoned lock");
                 }
                 if data.dead || data.eos {
                     return Err(gst::FlowError::Eos);
@@ -569,7 +620,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                     return Ok(gst::FlowSuccess::Ok);
                 };
 
-                if let Some(segment) = &segment {
+                let new_sample = if let Some(segment) = &segment {
                     let Some(buffer) = new_sample.buffer() else {
                         return Err(gst::FlowError::NotSupported)
                     };
@@ -582,17 +633,31 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
                     if start <= pts {
                         if let gst::GenericFormattedValue::Time(Some(stop)) = segment.stop() {
                             if pts < stop {
-                                data.new_sample = Some(new_sample);
+                                Some(new_sample)
                             } else {
                                 data.eos = true;
+                                None
                             }
                         } else {
-                            data.new_sample = Some(new_sample);
+                            Some(new_sample)
                         }
+                    } else {
+                        None
                     }
                 } else {
-                    data.new_sample = Some(new_sample);
+                    Some(new_sample)
                 };
+
+                if let Some(new_sample) = new_sample {
+                    if let Some(per_n_frames) = data.per_n_frames {
+                        if data.n_pulled_frames % per_n_frames == 0 {
+                            data.new_sample = Some(new_sample);
+                        }
+                    } else {
+                        data.new_sample = Some(new_sample);
+                    }
+                    data.n_pulled_frames += 1;
+                }
 
                 cvar.notify_all();
                 Ok(gst::FlowSuccess::Ok)

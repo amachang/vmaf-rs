@@ -15,6 +15,9 @@ struct Args {
 
     #[arg(short, long)]
     duration_sec: Option<f64>,
+
+    #[arg(short, long)]
+    fps: Option<usize>,
 }
 
 fn main() -> Result<(), Box<dyn error::Error>> {
@@ -29,7 +32,9 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     } else {
         None
     };
-    let mut stream = gst::PictureStream::from_path(args.path, gst::PictureStreamOpts { start, duration, ..Default::default() })?;
+    let fps = args.fps;
+
+    let mut stream = gst::PictureStream::from_path(args.path, gst::PictureStreamOpts { start, duration, fps, ..Default::default() })?;
 
     let pb = ProgressBar::new(0);
     pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% (ETA: {eta})")?
@@ -42,11 +47,16 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     let progress_update_interval = Duration::from_millis(100);
     let mut progress_updated_at = Instant::now();
 
+    let start = start.map(|c| c.nseconds()).unwrap_or(0);
     while let Some(_pic) = stream.next_pic()? {
         if progress_update_interval < progress_updated_at.elapsed() {
             if let (Some(pos), Some(dur)) = (stream.position_nanos(), stream.duration_nanos()) {
-                pb.set_length(dur);
-                pb.set_position(pos);
+                if let Some(duration) = duration {
+                    pb.set_length(duration.nseconds() + start);
+                } else {
+                    pb.set_length(dur);
+                }
+                pb.set_position(pos - start);
             }
             progress_updated_at = Instant::now();
         }
