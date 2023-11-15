@@ -38,7 +38,6 @@ pub use libvmaf::PixelFormat;
 pub use libvmaf::Component;
 pub use libvmaf::Frame;
 
-
 #[derive(Debug)]
 pub enum Error {
     LibvmafError(String, libvmaf::Error),
@@ -98,6 +97,34 @@ fn liberr_converter(description: String) -> impl FnOnce(libvmaf::Error) -> Error
 }
 
 
+pub trait Score: Sized {
+    fn use_feature(context: &mut libvmaf::Context, model: &libvmaf::Model) -> Result<(), Error>;
+    fn collect_score(context: &libvmaf::Context, model: &libvmaf::Model, pool_method: PoolingMethod, n_scores: usize) -> Result<Self, Error>;
+}
+
+impl Score for f64 {
+    fn use_feature(context: &mut libvmaf::Context, model: &libvmaf::Model) -> Result<(), Error> {
+        context.use_simple_model_feature(model).map_err(liberr!("Failed to set model feature to use"))?;
+        Ok(())
+    }
+
+    fn collect_score(context: &libvmaf::Context, model: &libvmaf::Model, pool_method: PoolingMethod, n_scores: usize) -> Result<Self, Error> {
+        Ok(context.pooled_score(model, pool_method, 0, n_scores).map_err(liberr!("Failed to pool score"))?)
+    }
+}
+
+impl Score for BootstrappedScore {
+    fn use_feature(context: &mut libvmaf::Context, model: &libvmaf::Model) -> Result<(), Error> {
+        context.use_collection_model_feature(model).map_err(liberr!("Failed to set model feature to use"))?;
+        Ok(())
+    }
+
+    fn collect_score(context: &libvmaf::Context, model: &libvmaf::Model, pool_method: PoolingMethod, n_scores: usize) -> Result<Self, Error> {
+        Ok(context.pooled_bootstrapped_score(model, pool_method, 0, n_scores).map_err(liberr!("Failed to pool bootstrapped score"))?)
+    }
+}
+
+
 #[derive(Debug)] 
 pub struct ScoreCollectorOpts {
     pub log_level: LogLevel,
@@ -136,15 +163,16 @@ impl Default for ScoreCollectorCollectScoreOpts {
 }
 
 #[derive(Debug)]
-pub struct ScoreCollector<Score> {
+pub struct ScoreCollector<S: Score> {
     context: libvmaf::Context,
     model: Model,
     n_scores: AtomicUsize,
-    _marker: PhantomData<Score>,
+    _marker: PhantomData<S>,
 }
 
-impl<Score> ScoreCollector<Score> {
-    fn new_impl(model: Model, opts: ScoreCollectorOpts) -> Result<Self, Error> {
+impl<S: Score> ScoreCollector<S> {
+    pub fn new(model: Model, opts: ScoreCollectorOpts) -> Result<Self, Error> {
+
         let cfg = libvmaf::Configuration::builder()
             .log_level(opts.log_level)
             .n_threads(opts.n_threads)
@@ -152,8 +180,10 @@ impl<Score> ScoreCollector<Score> {
             .cpumask(opts.cpumask)
             .build().map_err(liberr!("Failed to build libvmaf Context Configuration"))?;
 
-        let context = libvmaf::Context::new(cfg).map_err(liberr!("Failed to build libvmaf context"))?;
+        let mut context = libvmaf::Context::new(cfg).map_err(liberr!("Failed to build libvmaf context"))?;
         let n_scores = AtomicUsize::new(0);
+
+        S::use_feature(&mut context, &model.model)?;
 
         Ok(Self { context, model, n_scores, _marker: PhantomData })
     }
@@ -165,6 +195,15 @@ impl<Score> ScoreCollector<Score> {
 
     pub fn n_scores(&self) -> usize {
         self.n_scores.load(Ordering::Acquire)
+    }
+
+    pub fn collect_score(&mut self, opts: ScoreCollectorCollectScoreOpts) -> Result<S, Error> {
+        self.context.wait_for_all_pictures_flushed().map_err(liberr!("Failed to flush scores"))?;
+        let score = S::collect_score(&self.context, &self.model.model, opts.pool_method, self.n_scores())?;
+
+        self.write_score_if_needed(opts.output_path, opts.output_format)?;
+
+        Ok(score)
     }
 
     fn write_score_if_needed(&self, output_path: Option<PathBuf>, output_format: Option<OutputFormat>) -> Result<(), Error> {
@@ -194,48 +233,6 @@ impl<Score> ScoreCollector<Score> {
                 },
             }
         }
-    }
-}
-
-impl ScoreCollector<f64> {
-    pub fn new(model: Model, opts: ScoreCollectorOpts) -> Result<Self, Error> {
-        let mut collector = Self::new_impl(model, opts)?;
-        collector.context.use_simple_model_feature(&collector.model.model).map_err(liberr!("Failed to set model feature to use"))?;
-        Ok(collector)
-    }
-
-    pub fn collect_score(&mut self, opts: ScoreCollectorCollectScoreOpts) -> Result<f64, Error> {
-        self.context.wait_for_all_pictures_flushed().map_err(liberr!("Failed to flush scores"))?;
-        let score = self.context.pooled_score(
-            &self.model.model,
-            opts.pool_method,
-            0, self.n_scores()
-        ).map_err(liberr!("Failed to pool score"))?;
-
-        self.write_score_if_needed(opts.output_path, opts.output_format)?;
-
-        Ok(score)
-    }
-}
-
-impl ScoreCollector<BootstrappedScore> {
-    pub fn new(model: Model, opts: ScoreCollectorOpts) -> Result<Self, Error> {
-        let mut collector = Self::new_impl(model, opts)?;
-        collector.context.use_collection_model_feature(&collector.model.model).map_err(liberr!("Failed to set model feature to use"))?;
-        Ok(collector)
-    }
-
-    pub fn collect_score(&mut self, opts: ScoreCollectorCollectScoreOpts) -> Result<BootstrappedScore, Error> {
-        self.context.wait_for_all_pictures_flushed().map_err(liberr!("Failed to flush scores"))?;
-        let score = self.context.pooled_bootstrapped_score(
-            &self.model.model,
-            opts.pool_method,
-            0, self.n_scores()
-        ).map_err(liberr!("Failed to pool bootstrapped score"))?;
-
-        self.write_score_if_needed(opts.output_path, opts.output_format)?;
-
-        Ok(score)
     }
 }
 
@@ -349,7 +346,7 @@ impl CollectScoreOpts {
         let Self { 
             model_flags, model_version, model_name_to_override,
             log_level, n_threads, n_subsample, cpumask,
-            pool_method, output_path, output_format,
+            pool_method, output_path, output_format
         } = self;
         (
             ModelOpts { flags: model_flags, version: model_version, name_to_override: model_name_to_override },
@@ -379,16 +376,20 @@ impl Default for CollectScoreOpts {
 }
 
 pub fn collect_score(ref_path: impl TryInto<AutoPictureStream, Error=Error>, dist_path: impl TryInto<AutoPictureStream, Error=Error>, opts: CollectScoreOpts) -> Result<f64, Error> {
+    collect_typed_score::<f64>(ref_path, dist_path, opts)
+}
+
+pub fn collect_typed_score<S: Score>(ref_path: impl TryInto<AutoPictureStream, Error=Error>, dist_path: impl TryInto<AutoPictureStream, Error=Error>, opts: CollectScoreOpts) -> Result<S, Error> {
     let ref_stream = ref_path.try_into()?;
     let dist_stream = dist_path.try_into()?;
 
-    collect_score_from_stream_pair(ref_stream, dist_stream, opts)
+    collect_typed_score_from_stream_pair(ref_stream, dist_stream, opts)
 }
 
-pub fn collect_score_from_stream_pair(mut ref_stream: impl PictureStream, mut dist_stream: impl PictureStream, opts: CollectScoreOpts) -> Result<f64, Error> {
+pub fn collect_typed_score_from_stream_pair<S: Score>(mut ref_stream: impl PictureStream, mut dist_stream: impl PictureStream, opts: CollectScoreOpts) -> Result<S, Error> {
     let (model_opts, score_collector_opts, collect_score_opts) = opts.into_score_collector_opts();
     let model = Model::new(model_opts)?;
-    let mut score_collector = ScoreCollector::<f64>::new(model, score_collector_opts)?;
+    let mut score_collector = ScoreCollector::<S>::new(model, score_collector_opts)?;
 
     while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic()?, dist_stream.next_pic()?) {
         score_collector.read_pictures(ref_pic, dist_pic)?;
@@ -396,23 +397,6 @@ pub fn collect_score_from_stream_pair(mut ref_stream: impl PictureStream, mut di
     score_collector.collect_score(collect_score_opts)
 }
 
-pub fn collect_bootstrapped_score(ref_path: impl TryInto<AutoPictureStream, Error=Error>, dist_path: impl TryInto<AutoPictureStream, Error=Error>, opts: CollectScoreOpts) -> Result<BootstrappedScore, Error> {
-    let ref_stream = ref_path.try_into()?;
-    let dist_stream = dist_path.try_into()?;
-
-    collect_bootstrapped_score_from_stream_pair(ref_stream, dist_stream, opts)
-}
-
-pub fn collect_bootstrapped_score_from_stream_pair(mut ref_stream: impl PictureStream, mut dist_stream: impl PictureStream, opts: CollectScoreOpts) -> Result<BootstrappedScore, Error> {
-    let (model_opts, score_collector_opts, collect_score_opts) = opts.into_score_collector_opts();
-    let model = Model::new(model_opts)?;
-    let mut score_collector = ScoreCollector::<BootstrappedScore>::new(model, score_collector_opts)?;
-
-    while let (Some(ref_pic), Some(dist_pic)) = (ref_stream.next_pic()?, dist_stream.next_pic()?) {
-        score_collector.read_pictures(ref_pic, dist_pic)?;
-    }
-    score_collector.collect_score(collect_score_opts)
-}
 
 #[derive(Debug)]
 pub struct Picture {
