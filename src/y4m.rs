@@ -147,6 +147,12 @@ pub struct PictureStream<R: io::Read> {
     height: usize,
 }
 
+impl<R: io::Read> crate::PictureStream for &mut PictureStream<R> {
+    fn next_pic(&mut self) -> Result<Option<Picture>, crate::Error> {
+        (*self).next_pic()
+    }
+}
+
 impl<R: io::Read> crate::PictureStream for PictureStream<R> {
     fn next_pic(&mut self) -> Result<Option<Picture>, crate::Error> {
         match self.dec.read_frame() {

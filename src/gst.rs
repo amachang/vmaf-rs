@@ -6,7 +6,6 @@ use gstreamer_app as gst_app;
 use gst::prelude::*;
 use lazy_static::lazy_static;
 
-
 pub fn supported() -> bool { true }
 
 
@@ -52,7 +51,7 @@ lazy_static! {
     static ref INIT_ONCE: Once = Once::new();
 }
 
-fn init_if_needed() {
+pub fn init() {
     INIT_ONCE.call_once(|| {
         let _ = gst::init();
     });
@@ -258,6 +257,12 @@ struct PictureStreamSinkThreadData {
     dead: bool,
 }
 
+impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for &mut PictureStream<R> {
+    fn next_pic(&mut self) -> Result<Option<Picture>, crate::Error> {
+        (*self).next_pic()
+    }
+}
+
 impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for PictureStream<R> {
     fn next_pic(&mut self) -> Result<Option<Picture>, crate::Error> {
         let Some(data) = self.data.as_ref() else {
@@ -306,7 +311,7 @@ impl PictureStream<BufReader<File>> {
 
 impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
     pub fn new(mut read: R, opts: PictureStreamOpts) -> Result<Self, Error> {
-        init_if_needed();
+        init();
         let pipeline = gst::Pipeline::default();
 
         // TODO impl From<io::Error>
@@ -708,24 +713,24 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
         });
     }
 
-    pub fn duration_nanos(&self) -> Option<u64> {
+    pub fn duration(&self) -> Option<gst::ClockTime> {
         let Some(ref data) = self.data else {
             return None;
         };
-        let Some(nanos) = data.pipeline.query_duration::<gst::format::ClockTime>() else {
+        let Some(time) = data.pipeline.query_duration::<gst::ClockTime>() else {
             return None;
         };
-        Some(*nanos)
+        Some(time)
     }
 
-    pub fn position_nanos(&self) -> Option<u64> {
+    pub fn position(&self) -> Option<gst::ClockTime> {
         let Some(ref data) = self.data else {
             return None;
         };
-        let Some(nanos) = data.pipeline.query_position::<gst::format::ClockTime>() else {
+        let Some(time) = data.pipeline.query_position::<gst::ClockTime>() else {
             return None;
         };
-        Some(*nanos)
+        Some(time)
     }
 }
 
