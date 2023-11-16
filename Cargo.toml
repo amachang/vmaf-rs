@@ -28,4 +28,8 @@ avx512 = ["libvmaf-sys/avx512"]
 [dev-dependencies]
 clap = { version = "4.4.7", features = ["derive"] }
 indicatif = "0.17.7"
+path_to_unicode_filename = "0.1.1"
+rand = "0.8.5"
+statrs = "0.16.0"
+tinytemplate = "1.2.1"
 
