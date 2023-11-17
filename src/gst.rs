@@ -303,6 +303,11 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> crate::PictureStream for Pi
 }
 
 impl PictureStream<BufReader<File>> {
+    pub fn from_raw_path(path: impl AsRef<Path>, video_info: &gst_video::VideoInfo, opts: PictureStreamOpts) -> Result<Self, Error> {
+        let read = BufReader::new(File::open(path)?);
+        Self::new_raw_video(read, video_info, opts)
+    }
+
     pub fn from_path(path: impl AsRef<Path>, opts: PictureStreamOpts) -> Result<Self, Error> {
         let read = BufReader::new(File::open(path)?);
         Self::new(read, opts)
@@ -310,7 +315,34 @@ impl PictureStream<BufReader<File>> {
 }
 
 impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
-    pub fn new(mut read: R, opts: PictureStreamOpts) -> Result<Self, Error> {
+    pub fn new(read: R, opts: PictureStreamOpts) -> Result<Self, Error> {
+        Self::new_impl(read, None, opts)
+    }
+
+    pub fn new_raw_video(read: R, video_info: &gst_video::VideoInfo, opts: PictureStreamOpts) -> Result<Self, Error> {
+        let rawvideoparse = gst::ElementFactory::make("rawvideoparse")
+            .property("width", video_info.width() as i32)
+            .property("height", video_info.height() as i32)
+            .property("format", video_info.format())
+            .property("framerate", video_info.fps())
+            .property("pixel-aspect-ratio", video_info.par())
+            .property("plane-strides", gst::Array::new(video_info.stride().into_iter().map(|n| *n as i32)).to_value())
+            .property("plane-offsets", gst::Array::new(video_info.offset().into_iter().map(|n| *n as i32)).to_value())
+            .property("frame-size", video_info.size() as u32)
+            .property("colorimetry", video_info.colorimetry().to_string())
+            .build()?;
+
+        if video_info.is_interlaced() {
+            rawvideoparse.set_property("interlaced", true);
+            rawvideoparse.set_property("ttf", video_info.field_order() == gst_video::VideoFieldOrder::TopFieldFirst)
+        } else {
+            rawvideoparse.set_property("interlaced", false)
+        }
+
+        Self::new_impl(read, Some(rawvideoparse), opts)
+    }
+
+    fn new_impl(mut read: R, src_parse_el: Option<gst::Element>, opts: PictureStreamOpts) -> Result<Self, Error> {
         init();
         let pipeline = gst::Pipeline::default();
 
@@ -360,7 +392,13 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
             .build();
 
         pipeline.add_many([&appsrc.upcast_ref(), &decodebin, &appsink.upcast_ref()])?;
-        gst::Element::link_many([&appsrc.upcast_ref(), &decodebin])?;
+        
+        if let Some(src_parse_el) = src_parse_el {
+            pipeline.add(&src_parse_el)?;
+            gst::Element::link_many([&appsrc.upcast_ref(), &src_parse_el, &decodebin])?;
+        } else {
+            gst::Element::link_many([&appsrc.upcast_ref(), &decodebin])?;
+        }
 
         Self::setup_docedbin_connection(&pipeline, &decodebin, &appsink);
 

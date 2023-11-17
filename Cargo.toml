@@ -27,7 +27,10 @@ avx512 = ["libvmaf-sys/avx512"]
 
 [dev-dependencies]
 clap = { version = "4.4.7", features = ["derive"] }
+env_logger = "0.10.1"
 indicatif = "0.17.7"
+log = "0.4.20"
+num_cpus = "1.16.0"
 path_to_unicode_filename = "0.1.1"
 rand = "0.8.5"
 statrs = "0.16.0"

@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     let start = start.map(|c| c.nseconds()).unwrap_or(0);
     while let Some(_pic) = stream.next_pic()? {
         if progress_update_interval < progress_updated_at.elapsed() {
-            if let (Some(pos), Some(dur)) = (stream.position_nanos(), stream.duration_nanos()) {
+            if let (Some(pos), Some(dur)) = (stream.position(), stream.duration()) {
                 if let Some(duration) = duration {
                     pb.set_length(duration.nseconds() + start);
                 } else {

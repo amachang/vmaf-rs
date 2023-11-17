@@ -1,8 +1,9 @@
-use std::{fs, error, cmp::Ordering, time::{Instant, Duration}, path::{Path, PathBuf}, collections::VecDeque, fmt::{self, Display}, sync::{Mutex, Arc, atomic::{self, AtomicUsize}}, ops::Deref};
+use std::{env, fs, error, ffi::OsStr, cmp::Ordering, time::{Instant, Duration}, path::{Path, PathBuf}, collections::VecDeque, fmt::{self, Display}, sync::{Mutex, Arc, atomic::{self, AtomicUsize}}, ops::Deref};
 use clap::Parser;
 use gstreamer as gst;
 use gstreamer_video as gst_video;
 use gst::prelude::*;
+use vmaf::PictureStream;
 use path_to_unicode_filename::to_filename;
 use tinytemplate::TinyTemplate;
 use rand::distributions::{Uniform, Distribution as RandDistribution};
@@ -13,7 +14,7 @@ use statrs::statistics::{self, Distribution as StatDistribution};
 #[clap(author, version, about, long_about = None)]
 struct Args {
     #[arg()]
-    path: PathBuf,
+    dir: PathBuf,
 
     #[arg()]
     target_vmaf: f64,
@@ -21,7 +22,7 @@ struct Args {
     #[arg(short, long, default_value_t=10)]
     fps: usize,
 
-    #[arg(short, long, default_value_t=60)]
+    #[arg(short, long, default_value_t=10)]
     segment_size: usize,
 
     #[arg(short, long, default_value="tmp")]
@@ -36,16 +37,13 @@ enum Error {
     FailedToSeekPipeline(String),
     FailedToChangePipelineState(String),
     VmafError(vmaf::Error),
-    CapsCouldntChangedInSingleStream,
-    FailedToGetPipelineBus,
-    CapsNotFound,
-    UnexpectedEos,
-    CapsStructureNotFound,
-    TooManyCapsStructure(String),
-    InvalidCapStructureName(String),
-    FrameRateNotFound(String),
-    PixelAspectRatioNotFound(String),
+    ChangingVideoInfoNotAllowed(String),
     CouldntGetVideoInfoFromCaps(String),
+    FailedToGetPipelineBus,
+    VideoInfoNotFound,
+    UnexpectedEos,
+    RawFileStreamShorter,
+    EncodedFileStreamShorter,
 }
 
 impl From<vmaf::Error> for Error {
@@ -82,18 +80,93 @@ unsafe impl Send for Error { }
 unsafe impl Sync for Error { }
 impl error::Error for Error { }
 
-fn main() -> Result<(), Box<dyn error::Error>> {
+fn main() {
+    env::set_var("SVT_LOG", "2"); // SVT_LOG=warn
+    env_logger::init();
+    
+    let Args { target_vmaf, dir, tmp_dir, segment_size, fps } = Args::parse();
+
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    for entry in fs::read_dir(&dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+
+        let video_info = match video_info(&path) {
+            Err(err) => {
+                print_tsv(&path, "Error", Some(format!("CouldntGetVideoInfo:{:?}", err)), None, None, None, None, None);
+                continue;
+            },
+            Ok(video_info) => video_info,
+        };
+
+        let width = video_info.width() as usize;
+        let height = video_info.height() as usize;
+
+        let results = match process_file(&path, target_vmaf, fps, segment_size, &tmp_dir) {
+            Err(err) => {
+                print_tsv(&path, "Error", Some(format!("ProcessError:{:?}", err)), Some(width), Some(height), None, None, None);
+                continue;
+            },
+            Ok(results) => results,
+        };
+        for (enc, result) in results {
+            if let Some((value, result)) = result {
+                print_tsv(&path, "Error", None, Some(width), Some(height), Some(enc), Some(value), Some(result));
+            } else {
+                print_tsv(&path, "NotFound", None, Some(width), Some(height), Some(enc), None, None);
+            }
+        }
+
+        for entry in fs::read_dir(&tmp_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            match path.extension().and_then(OsStr::to_str) {
+                Some("yuv") | Some("mkv") => fs::remove_file(path).unwrap(),
+                _ => (),
+            }
+        }
+    }
+
+    // TODO rough
+    fn print_tsv(path: &Path, kind: &str, err_message: Option<String>, width: Option<usize>, height: Option<usize>, enc: Option<String>, value: Option<isize>, result: Option<ComparisonResult>) {
+        print!("{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            path.display(),
+            kind,
+            err_message.unwrap_or(String::from("")),
+            width.map(|u| u.to_string()).unwrap_or(String::from("")),
+            height.map(|u| u.to_string()).unwrap_or(String::from("")),
+            enc.unwrap_or(String::from("")),
+            value.map(|i| i.to_string()).unwrap_or(String::from("")),
+        );
+        if let Some(result) = result {
+            let bootstrapped_score = result.bootstrapped_score();
+            println!("\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                result.n_total_original_bytes,
+                result.n_total_decoded_bytes,
+                result.total_process_time.as_secs_f64(),
+                bootstrapped_score.bagging_score,
+                bootstrapped_score.ci_p95_lo,
+                bootstrapped_score.ci_p95_hi,
+                bootstrapped_score.stddev,
+            );
+        } else {
+            println!("\t\t\t\t\t\t\t");
+        }
+    }
+}
+
+fn process_file(path: impl AsRef<Path>, target_vmaf: f64, fps: usize, segment_size: usize, tmp_dir: impl AsRef<Path>) -> Result<Vec<(String, Option<(isize, ComparisonResult)>)>, Box<dyn error::Error>> {
+    let path = path.as_ref();
     let encoder_candidates: Vec<(&str, isize, (isize, isize))> = vec![
+        ("x265enc option-string=crf={@root} speed-preset=medium key-int-max=300 ! h265parse", 23, (51, 0)),
+        ("x265enc option-string=crf={@root} speed-preset=veryfast key-int-max=300 ! h265parse", 23, (51, 0)),
         ("svtav1enc preset=10 parameters-string=keyint=300:crf={@root}", 35, (63, 1)),
         ("svtav1enc preset=12 parameters-string=keyint=300:crf={@root}", 35, (63, 1)),
-        ("x265enc option-string=crf={@root} preset=medium key-int-max=300", 23, (51, 0)),
-        ("x265enc option-string=crf={@root} preset=veryfast key-int-max=300", 23, (51, 0)),
     ];
 
     let mut tt = TinyTemplate::new();
-    let args = Args::parse();
-
-    fs::create_dir_all(&args.tmp_dir)?;
+    let mut result = Vec::new();
 
     for (enc_template, initial_value, (worst_value, best_value)) in encoder_candidates {
         tt.add_template(enc_template, enc_template)?;
@@ -107,14 +180,15 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
         let value_result_pair = loop {
             let (ordering, result) = compare_with_target_vmaf(
-                &args.path, &args.tmp_dir, args.target_vmaf,
+                &path, &tmp_dir, target_vmaf,
                 tt.render(enc_template, &value)?,
                 CompareWithTargetVmafOpts {
-                    segment_size: gst::ClockTime::from_seconds(args.segment_size as u64),
-                    fps: Some(args.fps),
+                    segment_size: gst::ClockTime::from_seconds(segment_size as u64),
+                    fps: Some(fps),
                     ..Default::default()
                 },
             )?;
+            log::trace!("Segment vmaf: {:?} {:?}", ordering, result);
             match ordering {
                 Ordering::Equal => break Some((value, result)),
                 Ordering::Greater => {
@@ -140,20 +214,14 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             }
 
             value = (cur_worst_value + cur_best_value) / 2;
+
+            log::trace!("Next value: {} ({} - {})", value, cur_worst_value, cur_best_value);
         };
 
-        if let Some((value, result)) = value_result_pair {
-            println!("-- Encoder: {} --", tt.render(enc_template, &value)?);
-            println!("Compressed rate: {}", (result.n_total_decoded_bytes as f64) / (result.n_total_original_bytes as f64));
-            println!("Compressed bytes: {}", (result.n_total_original_bytes - result.n_total_decoded_bytes));
-            println!("Approx process time: {:?}", result.total_process_time);
-            println!("Compressed bytes per sec: {}", (result.n_total_original_bytes - result.n_total_decoded_bytes) as f64 / result.total_process_time.as_secs_f64());
-        } else {
-            println!("-- Not found: {} --", enc_template);
-        };
+        result.push((enc_template.to_string(), value_result_pair));
     }
 
-    Ok(())
+    Ok(result)
 }
 
 #[derive(Debug)]
@@ -268,37 +336,61 @@ fn compare_with_target_vmaf(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, 
     let mut result = ComparisonResult::new();
 
     let video_duration = video_duration(path)?;
-    println!("Video duration: {}", video_duration);
+    log::trace!("Video duration: {}", video_duration);
 
     for (start, duration) in SegmentIterator::new(video_duration, opts.segment_size) {
-        let (raw_path, n_original_bytes, decoding_time, caps) = create_segment_raw_file(path, &save_dir, start, duration)?;
-        println!("Original video stream size: {}", n_original_bytes);
-        println!("Decoding time: {:?}", decoding_time);
-        println!("Caps: {}", caps);
+        let (raw_path, n_original_bytes, decoding_time, video_info) = create_segment_raw_file(path, &save_dir, start, duration)?;
+        log::trace!("Original video stream size: {}", n_original_bytes);
+        log::trace!("Decoding time: {:?}", decoding_time);
+        log::trace!("Video info: {:?}", video_info);
 
         // decode the raw file
-        let (decoded_path, n_decoded_bytes, encoding_time) = encode_raw_file(&raw_path, &save_dir, &enc, caps)?;
-        println!("Encoding time: {:?}", encoding_time);
-        println!("Decoded video stream size: {}", n_decoded_bytes);
+        let (decoded_path, n_decoded_bytes, encoding_time) = encode_raw_file(&raw_path, &save_dir, &enc, &video_info)?;
+        log::trace!("Encoding time: {:?}", encoding_time);
+        log::trace!("Decoded video stream size: {}", n_decoded_bytes);
 
         // collect vmaf score for segment
         let fps = opts.fps;
-        let mut ref_stream = vmaf::gst::PictureStream::from_path(&raw_path, vmaf::gst::PictureStreamOpts { fps, ..Default::default() })?;
+        let mut ref_stream = vmaf::gst::PictureStream::from_raw_path(&raw_path, &video_info, vmaf::gst::PictureStreamOpts { fps, ..Default::default() })?;
         let mut dist_stream = vmaf::gst::PictureStream::from_path(decoded_path, vmaf::gst::PictureStreamOpts { fps, ..Default::default() })?;
-        let score = vmaf::collect_typed_score_from_stream_pair::<vmaf::BootstrappedScore>(&mut ref_stream, &mut dist_stream, vmaf::CollectScoreOpts::default())?;
+
+        let mut score_collector = vmaf::ScoreCollector::<vmaf::BootstrappedScore>::new(vmaf::Model::default(), vmaf::ScoreCollectorOpts {
+            n_threads: num_cpus::get(),
+            ..Default::default()
+        })?;
+
+        let pb = ProgressBar::new("Comparing streams");
+        let mut progress_updated_at = Instant::now();
+        loop {
+            let (ref_pic, dist_pic) = match (ref_stream.next_pic()?, dist_stream.next_pic()?) {
+                (Some(ref_pic), Some(dist_pic)) => (ref_pic, dist_pic),
+                (None, None) => break,
+                (None, Some(_)) => return Err(Error::RawFileStreamShorter),
+                (Some(_), None) => return Err(Error::EncodedFileStreamShorter),
+            };
+            if Duration::from_millis(100) < progress_updated_at.elapsed() {
+                if let (Some(pos), Some(dur)) = (dist_stream.position(), dist_stream.duration()) {
+                    pb.update(pos.nseconds(), dur.nseconds());
+                    progress_updated_at = Instant::now();
+                }
+            }
+            score_collector.read_pictures(ref_pic, dist_pic)?;
+        };
+        let score = score_collector.collect_score(vmaf::ScoreCollectorCollectScoreOpts::default())?;
 
         result.n_total_original_bytes += n_original_bytes;
         result.n_total_decoded_bytes += n_decoded_bytes;
         result.total_process_time += decoding_time + encoding_time;
         result.scores.push(score.bagging_score);
 
-        if 3 <= result.scores.len() {
+        if 2 <= result.scores.len() {
             let bootstrapped_score = result.bootstrapped_score();
+            log::debug!("Enc {} Score: {:?}", &enc, bootstrapped_score);
             if target_vmaf <= bootstrapped_score.ci_p95_lo {
                 ordering = Some(Ordering::Greater);
                 break;
             } else if bootstrapped_score.ci_p95_hi <= target_vmaf {
-                ordering = Some(Ordering::Greater);
+                ordering = Some(Ordering::Less);
                 break;
             } else if bootstrapped_score.ci_p95_hi - bootstrapped_score.ci_p95_lo < 1.0 {
                 ordering = Some(Ordering::Equal);
@@ -345,6 +437,24 @@ impl Drop for ProgressBar {
     }
 }
 
+// TODO only rough impl
+fn video_info(path: impl AsRef<Path>) -> Result<gst_video::VideoInfo, Error> {
+    let path = path.as_ref();
+    let pipeline = make_pipeline("filesrc name=src ! decodebin force-sw-decoders=true ! fakesink sync=false name=sink");
+
+    let filesrc = element_by_name(&*pipeline, "src");
+    filesrc.set_property("location", path);
+
+    pipeline_wait_paused(&*pipeline)?;
+
+    let fakesink = element_by_name(&*pipeline, "sink");
+    let sink_pad = fakesink.static_pad("sink").expect("hardcoded");
+    let caps = sink_pad.caps().expect("sink of paused pipeline must have caps");
+    let video_info = gst_video::VideoInfo::from_caps(&caps).map_err(|err| Error::CouldntGetVideoInfoFromCaps(format!("{:?}", err)))?;
+
+    Ok(video_info)
+}
+
 fn video_duration(path: impl AsRef<Path>) -> Result<gst::ClockTime, Error> {
     let path = path.as_ref();
     let pipeline = make_pipeline("filesrc name=src ! decodebin force-sw-decoders=true ! fakesink sync=false");
@@ -361,7 +471,7 @@ fn video_duration(path: impl AsRef<Path>) -> Result<gst::ClockTime, Error> {
     Ok(duration)
 }
 
-fn create_segment_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, start: gst::ClockTime, duration: gst::ClockTime) -> Result<(PathBuf, usize, Duration, gst::Caps), Error> {
+fn create_segment_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, start: gst::ClockTime, duration: gst::ClockTime) -> Result<(PathBuf, usize, Duration, gst_video::VideoInfo), Error> {
     let path = path.as_ref();
     let save_dir = save_dir.as_ref();
     let pipeline = make_pipeline("filesrc name=src ! parsebin ! decodebin force-sw-decoders=true name=dec ! capsfilter caps=video/x-raw ! progressreport update-freq=1 silent=true name=progress ! filesink sync=false name=sink");
@@ -373,9 +483,9 @@ fn create_segment_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, s
     let sink_path = save_dir.join(format!("{}.yuv", to_filename(path)?));
     filesink.set_property("location", &sink_path);
     let sink_pad = filesink.static_pad("sink").expect("hardcoded pad name");
-    let caps = probe_unique_caps(&sink_pad);
+    let video_info = probe_video_info(&sink_pad);
 
-    println!("Yuv path: {}", sink_path.display());
+    log::trace!("Yuv path: {}", sink_path.display());
 
     let decodebin = element_by_name(&pipeline, "dec");
     let sink_pad = decodebin.static_pad("sink").expect("hardcoded pad name");
@@ -390,17 +500,17 @@ fn create_segment_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, s
     let pb = ProgressBar::new(&format!("Creating raw file {} ({})", start, duration));
     playback_pipeline_to_eos(&*pipeline, pb)?;
 
-    let caps = Arc::into_inner(caps).unwrap();
-    let caps = caps.into_inner().unwrap();
-    let Some(caps) = caps else {
-        return Err(Error::CapsNotFound);
+    let video_info = Arc::into_inner(video_info).unwrap();
+    let video_info = video_info.into_inner().unwrap();
+    let Some(video_info) = video_info else {
+        return Err(Error::VideoInfoNotFound);
     };
-    let caps = caps?;
+    let video_info = video_info?;
 
-    Ok((sink_path, n_total_buffer_bytes.load(atomic::Ordering::SeqCst), start_time.elapsed(), caps))
+    Ok((sink_path, n_total_buffer_bytes.load(atomic::Ordering::SeqCst), start_time.elapsed(), video_info))
 }
 
-fn encode_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, enc: impl AsRef<str>, caps: gst::Caps) -> Result<(PathBuf, usize, Duration), Error> {
+fn encode_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, enc: impl AsRef<str>, video_info: &gst_video::VideoInfo) -> Result<(PathBuf, usize, Duration), Error> {
     let path = path.as_ref();
     let save_dir = save_dir.as_ref();
     let enc = enc.as_ref();
@@ -410,38 +520,30 @@ fn encode_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, enc: impl
     filesrc.set_property("location", path);
 
     let rawvideoparse = element_by_name(&*pipeline, "parse");
-    let Some(caps_structure) = caps.structure(0) else {
-        return Err(Error::CapsStructureNotFound);
-    };
-    if caps.structure(1).is_some() {
-        return Err(Error::TooManyCapsStructure(format!("{:?}", caps.structure(1))));
-    };
-    if caps_structure.name() != "video/x-raw" {
-        return Err(Error::InvalidCapStructureName(format!("{}", caps_structure.name())));
-    };
-    let info = match gst_video::VideoInfo::from_caps(&caps) {
-        Ok(info) => info,
-        Err(err) => return Err(Error::CouldntGetVideoInfoFromCaps(format!("{:?}", err))),
-    };
-    rawvideoparse.set_property("format", info.format());
-    rawvideoparse.set_property("colorimetry", info.colorimetry().to_string());
-    match caps_structure.value("framerate") {
-        Ok(frame_rate) => rawvideoparse.set_property("framerate", frame_rate),
-        Err(err) => return Err(Error::FrameRateNotFound(format!("{:?}", err))),
-    };
-    rawvideoparse.set_property("width", info.width() as i32);
-    rawvideoparse.set_property("height", info.height() as i32);
-    rawvideoparse.set_property("interlaced", info.is_interlaced());
-    match caps_structure.value("pixel-aspect-ratio") {
-        Ok(pixel_aspect_ratio) => rawvideoparse.set_property("pixel-aspect-ratio", pixel_aspect_ratio),
-        Err(err) => return Err(Error::PixelAspectRatioNotFound(format!("{:?}", err))),
-    };
+    rawvideoparse.set_property("width", video_info.width() as i32);
+    rawvideoparse.set_property("height", video_info.height() as i32);
+    rawvideoparse.set_property("format", video_info.format());
+    rawvideoparse.set_property("framerate", video_info.fps());
+    rawvideoparse.set_property("pixel-aspect-ratio", video_info.par());
+    if video_info.is_interlaced() {
+        rawvideoparse.set_property("interlaced", true);
+        rawvideoparse.set_property("ttf", video_info.field_order() == gst_video::VideoFieldOrder::TopFieldFirst);
+    } else {
+        rawvideoparse.set_property("interlaced", false);
+    }
+    rawvideoparse.set_property("plane-strides", gst::Array::new(video_info.stride().into_iter().map(|n| *n as i32)).to_value());
+    rawvideoparse.set_property("plane-offsets", gst::Array::new(video_info.offset().into_iter().map(|n| *n as i32)).to_value());
+    rawvideoparse.set_property("frame-size", video_info.size() as u32);
+    rawvideoparse.set_property("colorimetry", video_info.colorimetry().to_string());
+
+    // XXX chroma site cannot be set to rawvideoparse
+    // is it ignorable?
 
     let filesink = element_by_name(&*pipeline, "sink");
     let sink_path = save_dir.join(format!("{}.mkv", to_filename(path)?));
     filesink.set_property("location", &sink_path);
 
-    println!("Encoded file path: {}", sink_path.display());
+    log::trace!("Encoded file path: {}", sink_path.display());
 
     let matroskamux = element_by_name(&*pipeline, "enc");
     let src_pad = matroskamux.static_pad("src").expect("hardcoded pad name");
@@ -556,25 +658,32 @@ fn probe_buffer_n_bytes(pad: &gst::Pad) -> Arc<AtomicUsize> {
     n_total_buffer_bytes
 }
 
-fn probe_unique_caps(pad: &gst::Pad) -> Arc<Mutex<Option<Result<gst::Caps, Error>>>> {
-    let caps = Arc::new(Mutex::new(None));
-    let caps_weak = Arc::downgrade(&caps);
+fn probe_video_info(pad: &gst::Pad) -> Arc<Mutex<Option<Result<gst_video::VideoInfo, Error>>>> {
+    let video_info = Arc::new(Mutex::new(None));
+    let video_info_weak = Arc::downgrade(&video_info);
 
     pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-        let Some(caps) = caps_weak.upgrade() else {
+        let Some(video_info) = video_info_weak.upgrade() else {
             return gst::PadProbeReturn::Ok;
         };
 
         match &info.data {
             Some(gst::PadProbeData::Event(event)) => match event.view() { // TODO as_ref?
-                gst::EventView::Caps(caps_event) => {
-                    let new_caps = caps_event.caps_owned();
-                    let mut caps = caps.lock().unwrap();
-                    if caps.is_some() {
-                        *caps = Some(Err(Error::CapsCouldntChangedInSingleStream))
+                gst::EventView::Caps(caps) => {
+                    let caps = caps.caps_owned();
+                    let mut video_info = video_info.lock().unwrap();
+                    if video_info.is_some() {
+                        *video_info = Some(Err(Error::ChangingVideoInfoNotAllowed(format!("{}", caps))));
                     } else {
-                        *caps = Some(Ok(new_caps));
-                    }
+                        match gst_video::VideoInfo::from_caps(&caps) {
+                            Ok(new_video_info) => {
+                                *video_info = Some(Ok(new_video_info));
+                            },
+                            Err(err) => {
+                                *video_info = Some(Err(Error::CouldntGetVideoInfoFromCaps(format!("{} ({})", caps, err))));
+                            },
+                        };
+                    };
                 },
                 _ => (),
             },
@@ -583,6 +692,6 @@ fn probe_unique_caps(pad: &gst::Pad) -> Arc<Mutex<Option<Result<gst::Caps, Error
         gst::PadProbeReturn::Ok
     });
 
-    caps
+    video_info
 }
 
