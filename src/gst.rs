@@ -324,13 +324,17 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
             .property("width", video_info.width() as i32)
             .property("height", video_info.height() as i32)
             .property("format", video_info.format())
-            .property("framerate", video_info.fps())
             .property("pixel-aspect-ratio", video_info.par())
             .property("plane-strides", gst::Array::new(video_info.stride().into_iter().map(|n| *n as i32)).to_value())
             .property("plane-offsets", gst::Array::new(video_info.offset().into_iter().map(|n| *n as i32)).to_value())
             .property("frame-size", video_info.size() as u32)
             .property("colorimetry", video_info.colorimetry().to_string())
             .build()?;
+
+        let framerate = video_info.fps();
+        if framerate.numer() != 0 {
+            rawvideoparse.set_property("framerate", framerate);
+        }
 
         if video_info.is_interlaced() {
             rawvideoparse.set_property("interlaced", true);

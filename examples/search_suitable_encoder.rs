@@ -14,7 +14,7 @@ use statrs::statistics::{self, Distribution as StatDistribution};
 #[clap(author, version, about, long_about = None)]
 struct Args {
     #[arg()]
-    dir: PathBuf,
+    path: PathBuf,
 
     #[arg()]
     target_vmaf: f64,
@@ -84,18 +84,26 @@ fn main() {
     env::set_var("SVT_LOG", "2"); // SVT_LOG=warn
     env_logger::init();
     
-    let Args { target_vmaf, dir, tmp_dir, segment_size, fps } = Args::parse();
+    let Args { target_vmaf, path, tmp_dir, segment_size, fps } = Args::parse();
 
     fs::create_dir_all(&tmp_dir).unwrap();
 
-    for entry in fs::read_dir(&dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
+    if path.is_dir() {
+        for entry in fs::read_dir(&path).unwrap() {
+            let entry = entry.unwrap();
+            let sub_path = entry.path();
+            process_file(&sub_path, target_vmaf, fps, segment_size, &tmp_dir);
+        }
+    } else {
+        process_file(&path, target_vmaf, fps, segment_size, &tmp_dir);
+    }
 
+    fn process_file(path: impl AsRef<Path>, target_vmaf: f64, fps: usize, segment_size: usize, tmp_dir: impl AsRef<Path>) {
+        let path = path.as_ref();
         let video_info = match video_info(&path) {
             Err(err) => {
-                print_tsv(&path, "Error", Some(format!("CouldntGetVideoInfo:{:?}", err)), None, None, None, None, None);
-                continue;
+                print_tsv(path, "Error", Some(format!("CouldntGetVideoInfo:{:?}", err)), None, None, None, None, None);
+                return;
             },
             Ok(video_info) => video_info,
         };
@@ -103,18 +111,18 @@ fn main() {
         let width = video_info.width() as usize;
         let height = video_info.height() as usize;
 
-        let results = match process_file(&path, target_vmaf, fps, segment_size, &tmp_dir) {
+        let results = match search_encoders(&path, target_vmaf, fps, segment_size, &tmp_dir) {
             Err(err) => {
-                print_tsv(&path, "Error", Some(format!("ProcessError:{:?}", err)), Some(width), Some(height), None, None, None);
-                continue;
+                print_tsv(path, "Error", Some(format!("ProcessError:{:?}", err)), Some(width), Some(height), None, None, None);
+                return;
             },
             Ok(results) => results,
         };
         for (enc, result) in results {
             if let Some((value, result)) = result {
-                print_tsv(&path, "Ok", None, Some(width), Some(height), Some(enc), Some(value), Some(result));
+                print_tsv(path, "Ok", None, Some(width), Some(height), Some(enc), Some(value), Some(result));
             } else {
-                print_tsv(&path, "NotFound", None, Some(width), Some(height), Some(enc), None, None);
+                print_tsv(path, "NotFound", None, Some(width), Some(height), Some(enc), None, None);
             }
         }
 
@@ -156,7 +164,7 @@ fn main() {
     }
 }
 
-fn process_file(path: impl AsRef<Path>, target_vmaf: f64, fps: usize, segment_size: usize, tmp_dir: impl AsRef<Path>) -> Result<Vec<(String, Option<(isize, ComparisonResult)>)>, Box<dyn error::Error>> {
+fn search_encoders(path: impl AsRef<Path>, target_vmaf: f64, fps: usize, segment_size: usize, tmp_dir: impl AsRef<Path>) -> Result<Vec<(String, Option<(isize, ComparisonResult)>)>, Box<dyn error::Error>> {
     let path = path.as_ref();
     let encoder_candidates: Vec<(&str, isize, (isize, isize))> = vec![
         // ("x265enc option-string=crf={@root} speed-preset=medium key-int-max=300 ! h265parse", 23, (51, 0)),
@@ -523,7 +531,10 @@ fn encode_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, enc: impl
     rawvideoparse.set_property("width", video_info.width() as i32);
     rawvideoparse.set_property("height", video_info.height() as i32);
     rawvideoparse.set_property("format", video_info.format());
-    rawvideoparse.set_property("framerate", video_info.fps());
+    let framerate = video_info.fps();
+    if framerate.numer() != 0 {
+        rawvideoparse.set_property("framerate", framerate);
+    }
     rawvideoparse.set_property("pixel-aspect-ratio", video_info.par());
     if video_info.is_interlaced() {
         rawvideoparse.set_property("interlaced", true);
