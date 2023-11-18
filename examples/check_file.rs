@@ -47,16 +47,16 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     let progress_update_interval = Duration::from_millis(100);
     let mut progress_updated_at = Instant::now();
 
-    let start = start.map(|c| c.nseconds()).unwrap_or(0);
+    let start = start.unwrap_or(ClockTime::ZERO);
     while let Some(_pic) = stream.next_pic()? {
         if progress_update_interval < progress_updated_at.elapsed() {
             if let (Some(pos), Some(dur)) = (stream.position(), stream.duration()) {
                 if let Some(duration) = duration {
-                    pb.set_length(duration.nseconds() + start);
+                    pb.set_length(duration.nseconds() + start.nseconds());
                 } else {
-                    pb.set_length(dur);
+                    pb.set_length(dur.nseconds());
                 }
-                pb.set_position(pos - start);
+                pb.set_position(pos.nseconds() - start.nseconds());
             }
             progress_updated_at = Instant::now();
         }

@@ -66,7 +66,7 @@ impl From<path_to_unicode_filename::Error> for Error {
 
 impl From<&gst::message::Error> for Error {
     fn from(err: &gst::message::Error) -> Self {
-        Self::PipelineSentErrorMessage(format!("{:?}", err))
+        Self::PipelineSentErrorMessage(format!("{}", err))
     }
 }
 

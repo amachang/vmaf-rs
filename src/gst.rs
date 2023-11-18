@@ -27,12 +27,6 @@ impl From<glib::BoolError> for Error {
     }
 }
 
-impl From<gst::StateChangeError> for Error {
-    fn from(err: gst::StateChangeError) -> Self {
-        Error::StateChangeError(format!("Gstreamer element failed to change state: {}", err))
-    }
-}
-
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
         Error::IoError(err)
@@ -449,10 +443,20 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
         };
 
         // Wait for all element connected for seek;
-        let state_changed = data.pipeline.set_state(gst::State::Paused)?;
+        let state_changed = data.pipeline.set_state(gst::State::Paused).map_err(|_| Error::StateChangeError("Media pipeline couldn't setup.".to_string()))?;
         if state_changed == gst::StateChangeSuccess::Async {
+            // wait state change
             let (result, state, pending_state) = data.pipeline.state(None);
-            let state_changed = result?;
+            let err = {
+                let (sink_thread_data, _cvar) = &*data.sink_thread_data;
+                let sink_thread_data = sink_thread_data.lock().expect("deny poisoned lock");
+                sink_thread_data.error_message.clone()
+            };
+            if let Some(err) = err {
+                return Err(Error::StateChangeError(format!("Media pipeline couldn't setup. {}", err)));
+            };
+
+            let state_changed = result.map_err(|_| Error::StateChangeError("Media pipeline couldn't setup.".to_string()))?;
             assert_eq!(state_changed, gst::StateChangeSuccess::Success);
             assert_eq!(pending_state, gst::State::VoidPending);
             assert_eq!(state, gst::State::Paused);
@@ -478,7 +482,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
             )?;
         };
 
-        data.pipeline.set_state(gst::State::Playing)?;
+        data.pipeline.set_state(gst::State::Playing).map_err(|_| Error::StateChangeError("Media pipeline couldn't playback.".to_string()))?;
 
         Ok(Self {
             data: Some(data),
