@@ -1,3 +1,6 @@
+/*.db
+/*.tsv
+/*.csv
 /tmp
 /*.log
 /vmaf_output.*

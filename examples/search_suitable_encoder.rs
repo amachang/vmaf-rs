@@ -22,7 +22,7 @@ struct Args {
     #[arg(short, long, default_value_t=10)]
     fps: usize,
 
-    #[arg(short, long, default_value_t=10)]
+    #[arg(short, long, default_value_t=20)]
     segment_size: usize,
 
     #[arg(short, long, default_value="tmp")]
@@ -112,7 +112,7 @@ fn main() {
         };
         for (enc, result) in results {
             if let Some((value, result)) = result {
-                print_tsv(&path, "Error", None, Some(width), Some(height), Some(enc), Some(value), Some(result));
+                print_tsv(&path, "Ok", None, Some(width), Some(height), Some(enc), Some(value), Some(result));
             } else {
                 print_tsv(&path, "NotFound", None, Some(width), Some(height), Some(enc), None, None);
             }
@@ -159,8 +159,8 @@ fn main() {
 fn process_file(path: impl AsRef<Path>, target_vmaf: f64, fps: usize, segment_size: usize, tmp_dir: impl AsRef<Path>) -> Result<Vec<(String, Option<(isize, ComparisonResult)>)>, Box<dyn error::Error>> {
     let path = path.as_ref();
     let encoder_candidates: Vec<(&str, isize, (isize, isize))> = vec![
-        ("x265enc option-string=crf={@root} speed-preset=medium key-int-max=300 ! h265parse", 23, (51, 0)),
-        ("x265enc option-string=crf={@root} speed-preset=veryfast key-int-max=300 ! h265parse", 23, (51, 0)),
+        // ("x265enc option-string=crf={@root} speed-preset=medium key-int-max=300 ! h265parse", 23, (51, 0)),
+        // ("x265enc option-string=crf={@root} speed-preset=veryfast key-int-max=300 ! h265parse", 23, (51, 0)),
         ("svtav1enc preset=10 parameters-string=keyint=300:crf={@root}", 35, (63, 1)),
         ("svtav1enc preset=12 parameters-string=keyint=300:crf={@root}", 35, (63, 1)),
     ];
@@ -383,7 +383,7 @@ fn compare_with_target_vmaf(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, 
         result.total_process_time += decoding_time + encoding_time;
         result.scores.push(score.bagging_score);
 
-        if 2 <= result.scores.len() {
+        if 3 <= result.scores.len() {
             let bootstrapped_score = result.bootstrapped_score();
             log::debug!("Enc {} Score: {:?}", &enc, bootstrapped_score);
             if target_vmaf <= bootstrapped_score.ci_p95_lo {
