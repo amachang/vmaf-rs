@@ -31,13 +31,14 @@ struct Args {
 
 #[derive(Debug)]
 enum Error {
+    MultipleVideoInfoInSegment(gst_video::VideoInfo, gst_video::VideoInfo), // recoverable
+
     CouldntGetVideoDuration(String),
     PathConversionError(String),
     PipelineSentErrorMessage(String),
     FailedToSeekPipeline(String),
     FailedToChangePipelineState(String),
     VmafError(vmaf::Error),
-    ChangingVideoInfoNotAllowed(String),
     CouldntGetVideoInfoFromCaps(String),
     FailedToGetPipelineBus,
     VideoInfoNotFound,
@@ -347,7 +348,14 @@ fn compare_with_target_vmaf(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, 
     log::trace!("Video duration: {}", video_duration);
 
     for (start, duration) in SegmentIterator::new(video_duration, opts.segment_size) {
-        let (raw_path, n_original_bytes, decoding_time, video_info) = create_segment_raw_file(path, &save_dir, start, duration)?;
+        let (raw_path, n_original_bytes, decoding_time, video_info) = match create_segment_raw_file(path, &save_dir, start, duration) {
+            Ok(raw_file_info) => raw_file_info,
+            Err(Error::MultipleVideoInfoInSegment(video_info, second_video_info)) => {
+                log::warn!("Multiple video info found. Skip the segment: {:?} != {:?}", video_info, second_video_info);
+                continue;
+            },
+            Err(err) => return Err(err),
+        };
         log::trace!("Original video stream size: {}", n_original_bytes);
         log::trace!("Decoding time: {:?}", decoding_time);
         log::trace!("Video info: {:?}", video_info);
@@ -490,10 +498,9 @@ fn create_segment_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, s
     let filesink = element_by_name(&*pipeline, "sink");
     let sink_path = save_dir.join(format!("{}.yuv", to_filename(path)?));
     filesink.set_property("location", &sink_path);
-    let sink_pad = filesink.static_pad("sink").expect("hardcoded pad name");
-    let video_info = probe_video_info(&sink_pad);
-
     log::trace!("Yuv path: {}", sink_path.display());
+    let sink_pad = filesink.static_pad("sink").expect("hardcoded pad name");
+    let video_info_data = probe_video_info(&sink_pad);
 
     let decodebin = element_by_name(&pipeline, "dec");
     let sink_pad = decodebin.static_pad("sink").expect("hardcoded pad name");
@@ -501,19 +508,16 @@ fn create_segment_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, s
     let n_total_buffer_bytes = probe_buffer_n_bytes(&sink_pad);
 
     let start_time = Instant::now();
-    pipeline_wait_paused(&*pipeline)?;
 
+    pipeline_wait_paused(&*pipeline)?;
     pipeline.seek(1.0, gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, gst::SeekType::Set, start, gst::SeekType::Set, start + duration).map_err(|err| Error::FailedToSeekPipeline(format!("{:?}", err)))?;
 
     let pb = ProgressBar::new(&format!("Creating raw file {} ({})", start, duration));
     playback_pipeline_to_eos(&*pipeline, pb)?;
 
-    let video_info = Arc::into_inner(video_info).unwrap();
-    let video_info = video_info.into_inner().unwrap();
-    let Some(video_info) = video_info else {
-        return Err(Error::VideoInfoNotFound);
-    };
-    let video_info = video_info?;
+    let video_info_data = Arc::into_inner(video_info_data).unwrap();
+    let video_info_data = video_info_data.into_inner().unwrap();
+    let video_info = video_info_data.into_video_info()?;
 
     Ok((sink_path, n_total_buffer_bytes.load(atomic::Ordering::SeqCst), start_time.elapsed(), video_info))
 }
@@ -669,31 +673,83 @@ fn probe_buffer_n_bytes(pad: &gst::Pad) -> Arc<AtomicUsize> {
     n_total_buffer_bytes
 }
 
-fn probe_video_info(pad: &gst::Pad) -> Arc<Mutex<Option<Result<gst_video::VideoInfo, Error>>>> {
-    let video_info = Arc::new(Mutex::new(None));
-    let video_info_weak = Arc::downgrade(&video_info);
+#[derive(Debug)]
+struct VideoInfoData {
+    video_info: Option<gst_video::VideoInfo>,
+    error: Option<Error>,
+}
 
-    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-        let Some(video_info) = video_info_weak.upgrade() else {
-            return gst::PadProbeReturn::Ok;
+impl VideoInfoData {
+    fn new() -> Self {
+        Self {
+            video_info: None,
+            error: None,
+        }
+    }
+
+    fn into_video_info(self) -> Result<gst_video::VideoInfo, Error> {
+        if let Some(err) = self.error {
+            Err(err)
+        } else if let Some(video_info) = self.video_info {
+            Ok(video_info)
+        } else {
+            Err(Error::VideoInfoNotFound)
+        }
+    }
+}
+
+fn probe_video_info(pad: &gst::Pad) -> Arc<Mutex<VideoInfoData>> {
+    let video_info_data: Arc<Mutex<VideoInfoData>> = Arc::new(Mutex::new(VideoInfoData::new()));
+    let video_info_data_weak_for_flush_probe = Arc::downgrade(&video_info_data);
+    let video_info_data_weak_for_event_probe = Arc::downgrade(&video_info_data);
+
+    pad.add_probe(gst::PadProbeType::EVENT_FLUSH, move |_pad, info| {
+        let Some(video_info_data) = video_info_data_weak_for_flush_probe.upgrade() else {
+            return gst::PadProbeReturn::Remove;
         };
 
         match &info.data {
-            Some(gst::PadProbeData::Event(event)) => match event.view() { // TODO as_ref?
+            Some(gst::PadProbeData::Event(event)) => match event.view() {
+                gst::EventView::FlushStart(_) => (),
+                gst::EventView::FlushStop(_) => {
+                    let video_info_data = video_info_data.deref();
+                    let mut video_info_data = video_info_data.lock().unwrap();
+                    if video_info_data.error.is_none() {
+                        video_info_data.video_info = None;
+                    }
+                },
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        gst::PadProbeReturn::Ok
+    });
+
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+        let Some(video_info_data) = video_info_data_weak_for_event_probe.upgrade() else {
+            return gst::PadProbeReturn::Remove;
+        };
+
+        match &info.data {
+            Some(gst::PadProbeData::Event(event)) => match event.view() {
                 gst::EventView::Caps(caps) => {
                     let caps = caps.caps_owned();
-                    let mut video_info = video_info.lock().unwrap();
-                    if video_info.is_some() {
-                        *video_info = Some(Err(Error::ChangingVideoInfoNotAllowed(format!("{}", caps))));
-                    } else {
-                        match gst_video::VideoInfo::from_caps(&caps) {
-                            Ok(new_video_info) => {
-                                *video_info = Some(Ok(new_video_info));
-                            },
-                            Err(err) => {
-                                *video_info = Some(Err(Error::CouldntGetVideoInfoFromCaps(format!("{} ({})", caps, err))));
-                            },
-                        };
+                    let video_info_data = video_info_data.deref();
+                    let mut video_info_data = video_info_data.lock().unwrap();
+                    match gst_video::VideoInfo::from_caps(&caps) {
+                        Ok(new_video_info) => {
+                            if let Some(old_video_info) = &video_info_data.video_info {
+                                if new_video_info != *old_video_info {
+                                    video_info_data.error = Some(Error::MultipleVideoInfoInSegment(new_video_info.clone(), old_video_info.clone()));
+                                }
+                            }
+                            if video_info_data.error.is_none() {
+                                video_info_data.video_info = Some(new_video_info);
+                            }
+                        },
+                        Err(err) => {
+                            video_info_data.error = Some(Error::CouldntGetVideoInfoFromCaps(format!("{} ({})", caps, err)));
+                        },
                     };
                 },
                 _ => (),
@@ -703,6 +759,8 @@ fn probe_video_info(pad: &gst::Pad) -> Arc<Mutex<Option<Result<gst_video::VideoI
         gst::PadProbeReturn::Ok
     });
 
-    video_info
+    video_info_data
 }
+
+
 
