@@ -4,6 +4,10 @@ use bitflags::bitflags;
 use libvmaf_sys::*;
 use os_str_bytes::OsStrBytes;
 
+extern "C" {
+    fn vmaf_picture_ref(dst_pic: *mut VmafPicture, ref_pic: *mut VmafPicture) -> libc::c_int;
+}
+
 #[derive(Debug)]
 pub enum Error {
     SysError(SysError),
@@ -1178,7 +1182,22 @@ impl Picture {
             }
         };
 
-        Ok(Picture { ptr: Some(ptr) })
+        Ok(Self { ptr: Some(ptr) })
+    }
+
+    pub fn clone(&self) -> Result<Self, Error> {
+        let Some(ref src_ptr) = &self.ptr else {
+            return Err(Error::PitureAlreadyConsumed);
+        };
+
+        let mut dst_ptr: Box<VmafPicture> = Box::new(unsafe { mem::zeroed() });
+
+        let r = unsafe { vmaf_picture_ref(dst_ptr.as_mut(), src_ptr.as_ref() as *const _ as *mut _) };
+        if r != 0 {
+            return Err(Error::from_sys(r));
+        }
+
+        Ok(Self { ptr: Some(dst_ptr) })
     }
 
     fn consume(mut self) -> Result<Box<VmafPicture>, Error> {

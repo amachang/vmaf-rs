@@ -408,6 +408,11 @@ impl Picture {
         let picture = libvmaf::Picture::new(frame).map_err(liberr!("Failed to create picture"))?;
         Ok(Self { picture })
     }
+
+    pub fn clone(&self) -> Result<Self, Error> {
+        let picture = self.picture.clone().map_err(liberr!("Failed to clone picture"))?;
+        Ok(Self { picture })
+    }
 }
 
 pub trait PictureStream {
