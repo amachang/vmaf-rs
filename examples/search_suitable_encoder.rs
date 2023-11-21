@@ -1,4 +1,4 @@
-use std::{env, fs, error, ffi::OsStr, cmp::Ordering, time::{Instant, Duration}, path::{Path, PathBuf}, collections::VecDeque, fmt::{self, Display}, sync::{Mutex, Arc, atomic::{self, AtomicUsize}}, ops::Deref};
+use std::{io, env, fs, error, ffi::OsStr, cmp::Ordering, time::{Instant, Duration}, path::{Path, PathBuf}, collections::VecDeque, fmt::{self, Display}, sync::{Mutex, Weak, Arc, atomic::{self, AtomicUsize}}, ops::Deref};
 use clap::Parser;
 use gstreamer as gst;
 use gstreamer_video as gst_video;
@@ -19,11 +19,11 @@ struct Args {
     #[arg()]
     target_vmaf: f64,
 
-    #[arg(short, long, default_value_t=10)]
-    fps: usize,
-
-    #[arg(short, long, default_value_t=20)]
+    #[arg(short, long, default_value_t=30)]
     segment_size: usize,
+
+    #[arg(short, long, default_value="output.csv")]
+    output_path: PathBuf,
 
     #[arg(short, long, default_value="tmp")]
     tmp_dir: PathBuf,
@@ -85,25 +85,27 @@ fn main() {
     env::set_var("SVT_LOG", "2"); // SVT_LOG=warn
     env_logger::init();
     
-    let Args { target_vmaf, path, tmp_dir, segment_size, fps } = Args::parse();
+    let Args { target_vmaf, path, tmp_dir, segment_size, output_path } = Args::parse();
 
     fs::create_dir_all(&tmp_dir).unwrap();
+
+    let mut csv_writer = csv::Writer::from_path(&output_path).unwrap();
 
     if path.is_dir() {
         for entry in fs::read_dir(&path).unwrap() {
             let entry = entry.unwrap();
             let sub_path = entry.path();
-            process_file(&sub_path, target_vmaf, fps, segment_size, &tmp_dir);
+            process_file(&sub_path, target_vmaf, segment_size, &mut csv_writer, &tmp_dir);
         }
     } else {
-        process_file(&path, target_vmaf, fps, segment_size, &tmp_dir);
+        process_file(&path, target_vmaf, segment_size, &mut csv_writer, &tmp_dir);
     }
 
-    fn process_file(path: impl AsRef<Path>, target_vmaf: f64, fps: usize, segment_size: usize, tmp_dir: impl AsRef<Path>) {
+    fn process_file<W: io::Write>(path: impl AsRef<Path>, target_vmaf: f64, segment_size: usize, csv_writer: &mut csv::Writer<W>, tmp_dir: impl AsRef<Path>) {
         let path = path.as_ref();
         let video_info = match video_info(&path) {
             Err(err) => {
-                print_tsv(path, "Error", Some(format!("CouldntGetVideoInfo:{:?}", err)), None, None, None, None, None);
+                writre_csv(csv_writer, path, "Error", Some(format!("CouldntGetVideoInfo:{:?}", err)), None, None, None, None, None);
                 return;
             },
             Ok(video_info) => video_info,
@@ -112,18 +114,18 @@ fn main() {
         let width = video_info.width() as usize;
         let height = video_info.height() as usize;
 
-        let results = match search_encoders(&path, target_vmaf, fps, segment_size, &tmp_dir) {
+        let results = match search_encoders(&path, target_vmaf, segment_size, &tmp_dir) {
             Err(err) => {
-                print_tsv(path, "Error", Some(format!("ProcessError:{:?}", err)), Some(width), Some(height), None, None, None);
+                writre_csv(csv_writer, path, "Error", Some(format!("ProcessError:{:?}", err)), Some(width), Some(height), None, None, None);
                 return;
             },
             Ok(results) => results,
         };
         for (enc, result) in results {
             if let Some((value, result)) = result {
-                print_tsv(path, "Ok", None, Some(width), Some(height), Some(enc), Some(value), Some(result));
+                writre_csv(csv_writer, path, "Ok", None, Some(width), Some(height), Some(enc), Some(value), Some(result));
             } else {
-                print_tsv(path, "NotFound", None, Some(width), Some(height), Some(enc), None, None);
+                writre_csv(csv_writer, path, "NotFound", None, Some(width), Some(height), Some(enc), None, None);
             }
         }
 
@@ -138,46 +140,77 @@ fn main() {
     }
 
     // TODO rough
-    fn print_tsv(path: &Path, kind: &str, err_message: Option<String>, width: Option<usize>, height: Option<usize>, enc: Option<String>, value: Option<isize>, result: Option<ComparisonResult>) {
-        print!("{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            path.display(),
-            kind,
+    fn writre_csv<W: io::Write>(
+        csv_writer: &mut csv::Writer<W>,
+        path: &Path,
+        kind: &str,
+        err_message: Option<String>,
+        width: Option<usize>,
+        height: Option<usize>,
+        enc: Option<String>,
+        value: Option<isize>,
+        result: Option<ComparisonResult>
+    ) {
+        let mut record = vec![
+            format!("{}", path.display()),
+            String::from(kind),
             err_message.unwrap_or(String::from("")),
             width.map(|u| u.to_string()).unwrap_or(String::from("")),
             height.map(|u| u.to_string()).unwrap_or(String::from("")),
             enc.unwrap_or(String::from("")),
             value.map(|i| i.to_string()).unwrap_or(String::from("")),
-        );
+        ];
         if let Some(result) = result {
             let bootstrapped_score = result.bootstrapped_score();
-            println!("\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                result.n_total_original_bytes,
-                result.n_total_decoded_bytes,
-                result.total_process_time.as_secs_f64(),
-                bootstrapped_score.bagging_score,
-                bootstrapped_score.ci_p95_lo,
-                bootstrapped_score.ci_p95_hi,
-                bootstrapped_score.stddev,
-            );
+
+            record.extend_from_slice(&[
+                result.n_total_original_bytes.to_string(),
+                result.n_total_decoded_bytes.to_string(),
+                result.total_process_time.as_secs_f64().to_string(),
+                bootstrapped_score.bagging_score.to_string(),
+                bootstrapped_score.ci_p95_lo.to_string(),
+                bootstrapped_score.ci_p95_hi.to_string(),
+                bootstrapped_score.stddev.to_string(),
+            ]);
         } else {
-            println!("\t\t\t\t\t\t\t");
+            record.extend_from_slice(&[
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ]);
         }
+        log::info!("Write score to csv: {:?}", record);
+        csv_writer.write_record(record).unwrap();
+        csv_writer.flush().unwrap();
     }
 }
 
-fn search_encoders(path: impl AsRef<Path>, target_vmaf: f64, fps: usize, segment_size: usize, tmp_dir: impl AsRef<Path>) -> Result<Vec<(String, Option<(isize, ComparisonResult)>)>, Box<dyn error::Error>> {
+fn search_encoders(path: impl AsRef<Path>, target_vmaf: f64, segment_size: usize, tmp_dir: impl AsRef<Path>) -> Result<Vec<(String, Option<(isize, ComparisonResult)>)>, Box<dyn error::Error>> {
     let path = path.as_ref();
-    let encoder_candidates: Vec<(&str, isize, (isize, isize))> = vec![
+    let encoder_candidates: Vec<(&str, usize, (usize, usize))> = vec![
         // ("x265enc option-string=crf={@root} speed-preset=medium key-int-max=300 ! h265parse", 23, (51, 0)),
         // ("x265enc option-string=crf={@root} speed-preset=veryfast key-int-max=300 ! h265parse", 23, (51, 0)),
-        ("svtav1enc preset=10 parameters-string=keyint=300:crf={@root}", 35, (63, 1)),
-        ("svtav1enc preset=12 parameters-string=keyint=300:crf={@root}", 35, (63, 1)),
+        ("svtav1enc preset=10 parameters-string=keyint=300:crf={@root}", 35, (55, 20)),
+        // ("svtav1enc preset=12 parameters-string=keyint=300:crf={@root}", 35, (63, 1)),
     ];
 
     let mut tt = TinyTemplate::new();
     let mut result = Vec::new();
 
     for (enc_template, initial_value, (worst_value, best_value)) in encoder_candidates {
+        log::info!("== Start encoder besec search ==");
+        log::info!("Path: {}", path.display());
+        log::info!("Encoder: {}", enc_template);
+        log::info!("================================");
+
+        let initial_value = initial_value as isize;
+        let worst_value = worst_value as isize;
+        let best_value = best_value as isize;
+
         tt.add_template(enc_template, enc_template)?;
         let value_worst_best_diff = best_value - worst_value;
         let value_range_length = value_worst_best_diff.abs();
@@ -188,12 +221,12 @@ fn search_encoders(path: impl AsRef<Path>, target_vmaf: f64, fps: usize, segment
         let mut value = initial_value;
 
         let value_result_pair = loop {
+            log::info!("Current value: {}", value);
             let (ordering, result) = compare_with_target_vmaf(
                 &path, &tmp_dir, target_vmaf,
                 tt.render(enc_template, &value)?,
                 CompareWithTargetVmafOpts {
                     segment_size: gst::ClockTime::from_seconds(segment_size as u64),
-                    fps: Some(fps),
                     ..Default::default()
                 },
             )?;
@@ -215,16 +248,22 @@ fn search_encoders(path: impl AsRef<Path>, target_vmaf: f64, fps: usize, segment
                     cur_best_value = value;
                 },
                 Ordering::Less => {
-                    cur_worst_value = value;
+                    cur_worst_value = value + value_direction;
                 }
             };
-            if (cur_worst_value - cur_best_value).abs() <= 1 {
+
+
+            if cur_worst_value == cur_best_value {
                 break worst_acceptable_value_result_pair;
             }
 
-            value = (cur_worst_value + cur_best_value) / 2;
 
-            log::trace!("Next value: {} ({} - {})", value, cur_worst_value, cur_best_value);
+            if value_direction < 0 {
+                value = (cur_worst_value + cur_best_value) / 2 + (cur_worst_value + cur_best_value) % 2;
+            } else {
+                value = (cur_worst_value + cur_best_value) / 2;
+            }
+            log::info!("Next value: {} ({} - {})", value, cur_worst_value, cur_best_value);
         };
 
         result.push((enc_template.to_string(), value_result_pair));
@@ -236,14 +275,12 @@ fn search_encoders(path: impl AsRef<Path>, target_vmaf: f64, fps: usize, segment
 #[derive(Debug)]
 struct CompareWithTargetVmafOpts {
     segment_size: gst::ClockTime,
-    fps: Option<usize>,
 }
 
 impl Default for CompareWithTargetVmafOpts {
     fn default() -> Self {
         Self {
             segment_size: gst::ClockTime::from_seconds(300),
-            fps: None,
         }
     }
 }
@@ -320,7 +357,7 @@ impl Iterator for SegmentIterator {
             return Some((start, duration));
         }
 
-        let segment_start = duration / 2 - self.segment_size / 2;
+        let segment_start = start + duration / 2 - self.segment_size / 2;
         let segment_end = segment_start + self.segment_size;
         self.remaining_segments.push_back((start, segment_start));
         self.remaining_segments.push_back((segment_end, end));
@@ -348,6 +385,8 @@ fn compare_with_target_vmaf(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, 
     log::trace!("Video duration: {}", video_duration);
 
     for (start, duration) in SegmentIterator::new(video_duration, opts.segment_size) {
+        log::info!("Start calculating vmaf for segment: {} ({})", start, duration);
+        log::trace!("Start segment: {} - {}", start, duration);
         let (raw_path, n_original_bytes, decoding_time, video_info) = match create_segment_raw_file(path, &save_dir, start, duration) {
             Ok(raw_file_info) => raw_file_info,
             Err(Error::MultipleVideoInfoInSegment(video_info, second_video_info)) => {
@@ -366,32 +405,34 @@ fn compare_with_target_vmaf(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, 
         log::trace!("Decoded video stream size: {}", n_decoded_bytes);
 
         // collect vmaf score for segment
-        let fps = opts.fps;
-        let mut ref_stream = vmaf::gst::PictureStream::from_raw_path(&raw_path, &video_info, vmaf::gst::PictureStreamOpts { fps, ..Default::default() })?;
-        let mut dist_stream = vmaf::gst::PictureStream::from_path(decoded_path, vmaf::gst::PictureStreamOpts { fps, ..Default::default() })?;
+        let mut ref_stream = vmaf::gst::PictureStream::from_raw_path(&raw_path, &video_info, vmaf::gst::PictureStreamOpts::default())?;
+        let mut dist_stream = vmaf::gst::PictureStream::from_path(decoded_path, vmaf::gst::PictureStreamOpts::default())?;
 
         let mut score_collector = vmaf::ScoreCollector::<vmaf::BootstrappedScore>::new(vmaf::Model::default(), vmaf::ScoreCollectorOpts {
             n_threads: num_cpus::get(),
             ..Default::default()
         })?;
 
-        let pb = ProgressBar::new("Comparing streams");
-        let mut progress_updated_at = Instant::now();
-        loop {
-            let (ref_pic, dist_pic) = match (ref_stream.next_pic()?, dist_stream.next_pic()?) {
-                (Some(ref_pic), Some(dist_pic)) => (ref_pic, dist_pic),
-                (None, None) => break,
-                (None, Some(_)) => return Err(Error::RawFileStreamShorter),
-                (Some(_), None) => return Err(Error::EncodedFileStreamShorter),
-            };
-            if Duration::from_millis(100) < progress_updated_at.elapsed() {
-                if let (Some(pos), Some(dur)) = (dist_stream.position(), dist_stream.duration()) {
-                    pb.update(pos.nseconds(), dur.nseconds());
-                    progress_updated_at = Instant::now();
+        {
+            let pb = ProgressBar::new("Comparing streams");
+            let mut progress_updated_at = Instant::now();
+            loop {
+                let (ref_pic, dist_pic) = match (ref_stream.next_pic()?, dist_stream.next_pic()?) {
+                    (Some(ref_pic), Some(dist_pic)) => (ref_pic, dist_pic),
+                    (None, None) => break,
+                    (None, Some(_)) => return Err(Error::RawFileStreamShorter),
+                    (Some(_), None) => return Err(Error::EncodedFileStreamShorter),
+                };
+                if Duration::from_millis(100) < progress_updated_at.elapsed() {
+                    if let (Some(pos), Some(dur)) = (dist_stream.position(), dist_stream.duration()) {
+                        pb.update(pos.nseconds(), dur.nseconds());
+                        progress_updated_at = Instant::now();
+                    }
                 }
-            }
-            score_collector.read_pictures(ref_pic, dist_pic)?;
-        };
+                score_collector.read_pictures(ref_pic, dist_pic)?;
+            };
+            // drop progress bar
+        }
         let score = score_collector.collect_score(vmaf::ScoreCollectorCollectScoreOpts::default())?;
 
         result.n_total_original_bytes += n_original_bytes;
@@ -399,16 +440,34 @@ fn compare_with_target_vmaf(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, 
         result.total_process_time += decoding_time + encoding_time;
         result.scores.push(score.bagging_score);
 
+        log::info!("Encoding rote: {:.2} MB -> {:.2} MB ({:.2} %) [n={}]",
+            result.n_total_original_bytes as f64 / 1000_000.0,
+            result.n_total_decoded_bytes as f64 / 1000_000.0,
+            result.n_total_decoded_bytes as f64 / result.n_total_original_bytes as f64 * 100.0,
+            result.scores.len(),
+        );
+        let bootstrapped_score = result.bootstrapped_score();
+
+        log::info!("Current vmaf score: {:.2} ({:.2} - {:.2}) [n={}]",
+            bootstrapped_score.bagging_score,
+            bootstrapped_score.ci_p95_lo,
+            bootstrapped_score.ci_p95_hi,
+            result.scores.len(),
+        );
+
         if 3 <= result.scores.len() {
-            let bootstrapped_score = result.bootstrapped_score();
             log::debug!("Enc {} Score: {:?}", &enc, bootstrapped_score);
             if target_vmaf <= bootstrapped_score.ci_p95_lo {
-                ordering = Some(Ordering::Greater);
+                if bootstrapped_score.ci_p95_hi < target_vmaf + 0.5 {
+                    ordering = Some(Ordering::Equal);
+                } else {
+                    ordering = Some(Ordering::Greater);
+                }
                 break;
             } else if bootstrapped_score.ci_p95_hi <= target_vmaf {
                 ordering = Some(Ordering::Less);
                 break;
-            } else if bootstrapped_score.ci_p95_hi - bootstrapped_score.ci_p95_lo < 1.0 {
+            } else if bootstrapped_score.ci_p95_hi - bootstrapped_score.ci_p95_lo < 0.5 {
                 ordering = Some(Ordering::Equal);
                 break;
             } else {
@@ -676,6 +735,7 @@ fn probe_buffer_n_bytes(pad: &gst::Pad) -> Arc<AtomicUsize> {
 #[derive(Debug)]
 struct VideoInfoData {
     video_info: Option<gst_video::VideoInfo>,
+    first_buffer_arrived: bool,
     error: Option<Error>,
 }
 
@@ -683,6 +743,7 @@ impl VideoInfoData {
     fn new() -> Self {
         Self {
             video_info: None,
+            first_buffer_arrived: false,
             error: None,
         }
     }
@@ -703,22 +764,39 @@ fn probe_video_info(pad: &gst::Pad) -> Arc<Mutex<VideoInfoData>> {
     let video_info_data_weak_for_flush_probe = Arc::downgrade(&video_info_data);
     let video_info_data_weak_for_event_probe = Arc::downgrade(&video_info_data);
 
-    pad.add_probe(gst::PadProbeType::EVENT_FLUSH, move |_pad, info| {
+    fn detect_first_buffer(pad: &gst::Pad, video_info_data_weak: Weak<Mutex<VideoInfoData>>) {
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            log::trace!("Filesink detect first buffer in segment");
+            let Some(video_info_data) = video_info_data_weak.upgrade() else {
+                return gst::PadProbeReturn::Remove;
+            };
+            let video_info_data = video_info_data.deref();
+            let mut video_info_data = video_info_data.lock().unwrap();
+            video_info_data.first_buffer_arrived = true;
+            return gst::PadProbeReturn::Remove;
+        });
+    }
+
+    detect_first_buffer(pad, Arc::downgrade(&video_info_data));
+
+    pad.add_probe(gst::PadProbeType::EVENT_FLUSH, move |pad, info| {
         let Some(video_info_data) = video_info_data_weak_for_flush_probe.upgrade() else {
             return gst::PadProbeReturn::Remove;
         };
 
         match &info.data {
             Some(gst::PadProbeData::Event(event)) => match event.view() {
-                gst::EventView::FlushStart(_) => (),
                 gst::EventView::FlushStop(_) => {
-                    let video_info_data = video_info_data.deref();
-                    let mut video_info_data = video_info_data.lock().unwrap();
-                    if video_info_data.error.is_none() {
-                        video_info_data.video_info = None;
+                    log::trace!("Filesink FLUSH_STOP event recieved");
+                    {
+                        let video_info_data = video_info_data.deref();
+                        let mut video_info_data = video_info_data.lock().unwrap();
+                        video_info_data.first_buffer_arrived = false; // not seen buffer yet in new segment
                     }
+
+                    detect_first_buffer(pad, Arc::downgrade(&video_info_data));
                 },
-                _ => unreachable!(),
+                _ => (),
             },
             _ => unreachable!(),
         };
@@ -733,14 +811,18 @@ fn probe_video_info(pad: &gst::Pad) -> Arc<Mutex<VideoInfoData>> {
         match &info.data {
             Some(gst::PadProbeData::Event(event)) => match event.view() {
                 gst::EventView::Caps(caps) => {
+                    log::trace!("Filesink CAPS event recieved");
                     let caps = caps.caps_owned();
                     let video_info_data = video_info_data.deref();
                     let mut video_info_data = video_info_data.lock().unwrap();
                     match gst_video::VideoInfo::from_caps(&caps) {
                         Ok(new_video_info) => {
-                            if let Some(old_video_info) = &video_info_data.video_info {
-                                if new_video_info != *old_video_info {
-                                    video_info_data.error = Some(Error::MultipleVideoInfoInSegment(new_video_info.clone(), old_video_info.clone()));
+                            // if first buffer arrived, not allowed change video info
+                            if video_info_data.first_buffer_arrived {
+                                if let Some(old_video_info) = &video_info_data.video_info {
+                                    if new_video_info != *old_video_info {
+                                        video_info_data.error = Some(Error::MultipleVideoInfoInSegment(new_video_info.clone(), old_video_info.clone()));
+                                    }
                                 }
                             }
                             if video_info_data.error.is_none() {
