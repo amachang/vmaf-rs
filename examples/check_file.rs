@@ -15,9 +15,6 @@ struct Args {
 
     #[arg(short, long)]
     duration_sec: Option<f64>,
-
-    #[arg(short, long)]
-    fps: Option<usize>,
 }
 
 fn main() -> Result<(), Box<dyn error::Error>> {
@@ -32,9 +29,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     } else {
         None
     };
-    let fps = args.fps;
-
-    let mut stream = gst::PictureStream::from_path(args.path, gst::PictureStreamOpts { start, duration, fps, ..Default::default() })?;
+    let mut stream = gst::PictureStream::from_path(args.path, gst::PictureStreamOpts { start, duration, ..Default::default() })?;
 
     let pb = ProgressBar::new(0);
     pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% (ETA: {eta})")?
