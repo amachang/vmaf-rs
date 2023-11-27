@@ -8,7 +8,6 @@ use path_to_unicode_filename::to_filename;
 use tinytemplate::TinyTemplate;
 use rand::distributions::{Uniform, Distribution as RandDistribution};
 use rand::thread_rng;
-use statrs::statistics::{self, Distribution as StatDistribution};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -194,8 +193,8 @@ fn search_encoders(path: impl AsRef<Path>, target_vmaf: f64, segment_size: usize
     let encoder_candidates: Vec<(&str, usize, (usize, usize))> = vec![
         // ("x265enc option-string=crf={@root} speed-preset=medium key-int-max=300 ! h265parse", 23, (51, 0)),
         // ("x265enc option-string=crf={@root} speed-preset=veryfast key-int-max=300 ! h265parse", 23, (51, 0)),
-        ("svtav1enc preset=10 parameters-string=keyint=300:crf={@root}", 35, (55, 20)),
-        // ("svtav1enc preset=12 parameters-string=keyint=300:crf={@root}", 35, (63, 1)),
+        ("svtav1enc preset=10 parameters-string=keyint=10s:crf={@root}", 35, (55, 20)),
+        // ("svtav1enc preset=12 parameters-string=keyint=10s:crf={@root}", 35, (63, 1)),
     ];
 
     let mut tt = TinyTemplate::new();
@@ -305,7 +304,7 @@ impl ComparisonResult {
 
     fn bootstrapped_score(&self) -> vmaf::BootstrappedScore {
         let mut rng = thread_rng();
-        let n_bootstrap = 10000;
+        let n_bootstrap = 1000;
         let mut bootstrap_means = Vec::with_capacity(n_bootstrap);
         let uniform = Uniform::from(0..self.scores.len());
         for _ in 0..n_bootstrap {
@@ -314,16 +313,14 @@ impl ComparisonResult {
             bootstrap_means.push(harmonic_mean);
         }
 
-        let data = statistics::Data::new(bootstrap_means);
-        let mean = data.mean().unwrap();
-        let stddev = data.std_dev().unwrap();
-        let stderr = stddev / (data.len() as f64).sqrt();
-        let lower = mean - 1.96 * stderr;
-        let higher = mean + 1.96 * stderr;
+        bootstrap_means.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = bootstrap_means.iter().sum::<f64>() / bootstrap_means.len() as f64;
+        let lower = bootstrap_means[(bootstrap_means.len() as f64 * 0.025) as usize];
+        let higher = bootstrap_means[(bootstrap_means.len() as f64 * 0.975) as usize];
 
         vmaf::BootstrappedScore {
             bagging_score: mean,
-            stddev: stddev,
+            stddev: 0.0,
             ci_p95_lo: lower,
             ci_p95_hi: higher,
         }
@@ -333,9 +330,10 @@ impl ComparisonResult {
         Self::harmonic_mean_impl(&self.scores)
     }
 
+    // the same way as libvmaf
     fn harmonic_mean_impl(scores: &Vec<f64>) -> f64 {
-        let sum: f64 = scores.iter().map(|&x| x.recip()).sum();
-        scores.len() as f64 / sum
+        let sum: f64 = scores.iter().map(|&x| 1.0 / (x + 1.0)).sum();
+        scores.len() as f64 / sum - 1.0
     }
 }
 
@@ -383,6 +381,8 @@ fn compare_with_target_vmaf(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, 
 
     let video_duration = video_duration(path)?;
     log::trace!("Video duration: {}", video_duration);
+
+    let mut segment_count = 0;
 
     for (start, duration) in SegmentIterator::new(video_duration, opts.segment_size) {
         log::info!("Start calculating vmaf for segment: {} ({})", start, duration);
@@ -433,30 +433,38 @@ fn compare_with_target_vmaf(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, 
             };
             // drop progress bar
         }
-        let score = score_collector.collect_score(vmaf::ScoreCollectorCollectScoreOpts::default())?;
+
 
         result.n_total_original_bytes += n_original_bytes;
         result.n_total_decoded_bytes += n_decoded_bytes;
         result.total_process_time += decoding_time + encoding_time;
-        result.scores.push(score.bagging_score);
+        for score_index in 0..score_collector.n_scores() {
+            let score = score_collector.score_at_index(score_index)?;
+            result.scores.push(score.bagging_score);
+        }
 
-        log::info!("Encoding rote: {:.2} MB -> {:.2} MB ({:.2} %) [n={}]",
+        let bootstrapped_score = result.bootstrapped_score();
+
+        segment_count += 1;
+
+        log::info!("Encoding rote: {:.2} MB -> {:.2} MB ({:.2} %) [n={}][seg={}]",
             result.n_total_original_bytes as f64 / 1000_000.0,
             result.n_total_decoded_bytes as f64 / 1000_000.0,
             result.n_total_decoded_bytes as f64 / result.n_total_original_bytes as f64 * 100.0,
             result.scores.len(),
+            segment_count,
         );
-        let bootstrapped_score = result.bootstrapped_score();
 
-        log::info!("Current vmaf score: {:.2} ({:.2} - {:.2}) [n={}]",
+        log::info!("Current vmaf score: {:.2} ({:.2} - {:.2}) [n={}][seg={}]",
             bootstrapped_score.bagging_score,
             bootstrapped_score.ci_p95_lo,
             bootstrapped_score.ci_p95_hi,
             result.scores.len(),
+            segment_count,
         );
 
-        if 3 <= result.scores.len() {
-            log::debug!("Enc {} Score: {:?}", &enc, bootstrapped_score);
+        if 3 <= segment_count {
+            log::trace!("Enc {} Score: {:?}", &enc, bootstrapped_score);
             if target_vmaf <= bootstrapped_score.ci_p95_lo {
                 if bootstrapped_score.ci_p95_hi < target_vmaf + 0.5 {
                     ordering = Some(Ordering::Equal);
@@ -564,7 +572,7 @@ fn create_segment_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, s
     let decodebin = element_by_name(&pipeline, "dec");
     let sink_pad = decodebin.static_pad("sink").expect("hardcoded pad name");
 
-    let n_total_buffer_bytes = probe_buffer_n_bytes(&sink_pad);
+    let n_total_buffer_bytes = probe_buffer_n_bytes(&sink_pad, start, Some(duration));
 
     let start_time = Instant::now();
 
@@ -601,7 +609,7 @@ fn encode_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, enc: impl
     rawvideoparse.set_property("pixel-aspect-ratio", video_info.par());
     if video_info.is_interlaced() {
         rawvideoparse.set_property("interlaced", true);
-        rawvideoparse.set_property("ttf", video_info.field_order() == gst_video::VideoFieldOrder::TopFieldFirst);
+        rawvideoparse.set_property("top-field-first", video_info.field_order() == gst_video::VideoFieldOrder::TopFieldFirst);
     } else {
         rawvideoparse.set_property("interlaced", false);
     }
@@ -622,7 +630,7 @@ fn encode_raw_file(path: impl AsRef<Path>, save_dir: impl AsRef<Path>, enc: impl
     let matroskamux = element_by_name(&*pipeline, "enc");
     let src_pad = matroskamux.static_pad("src").expect("hardcoded pad name");
 
-    let n_total_buffer_bytes = probe_buffer_n_bytes(&src_pad);
+    let n_total_buffer_bytes = probe_buffer_n_bytes(&src_pad, gst::ClockTime::ZERO, None);
 
     let start_time = Instant::now();
 
@@ -701,7 +709,7 @@ fn element_by_name(pipeline: &gst::Pipeline, name: &str) -> gst::Element {
     pipeline.by_name(name).expect(&format!("element must be added to pipeline"))
 }
 
-fn probe_buffer_n_bytes(pad: &gst::Pad) -> Arc<AtomicUsize> {
+fn probe_buffer_n_bytes(pad: &gst::Pad, start: gst::ClockTime, duration: Option<gst::ClockTime>) -> Arc<AtomicUsize> {
     let n_total_buffer_bytes = Arc::new(AtomicUsize::new(0));
     let n_total_buffer_bytes_weak = Arc::downgrade(&n_total_buffer_bytes);
 
@@ -714,6 +722,21 @@ fn probe_buffer_n_bytes(pad: &gst::Pad) -> Arc<AtomicUsize> {
             Some(gst::PadProbeData::Buffer(buffer)) => buffer,
             _ => panic!("pad probe info must have buffer"),
         };
+
+        let Some(pts) = buffer.pts() else {
+            return gst::PadProbeReturn::Ok;
+        };
+
+        if pts < start {
+            return gst::PadProbeReturn::Ok;
+        }
+
+        if let Some(duration) = duration {
+            if start + duration <= pts {
+                return gst::PadProbeReturn::Ok;
+            }
+        }
+
         let n_buffer_bytes = buffer.size();
 
         let mut old_n_bytes = n_total_buffer_bytes.load(atomic::Ordering::Relaxed);
