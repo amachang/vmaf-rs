@@ -99,6 +99,7 @@ fn liberr_converter(description: String) -> impl FnOnce(libvmaf::Error) -> Error
 
 pub trait Score: Sized {
     fn use_feature(context: &mut libvmaf::Context, model: &libvmaf::Model) -> Result<(), Error>;
+    fn score_at_index(context: &libvmaf::Context, model: &libvmaf::Model, index: usize) -> Result<Self, Error>;
     fn collect_score(context: &libvmaf::Context, model: &libvmaf::Model, pool_method: PoolingMethod, n_scores: usize) -> Result<Self, Error>;
 }
 
@@ -106,6 +107,10 @@ impl Score for f64 {
     fn use_feature(context: &mut libvmaf::Context, model: &libvmaf::Model) -> Result<(), Error> {
         context.use_simple_model_feature(model).map_err(liberr!("Failed to set model feature to use"))?;
         Ok(())
+    }
+
+    fn score_at_index(context: &libvmaf::Context, model: &libvmaf::Model, index: usize) -> Result<Self, Error> {
+        Ok(context.score_at_index(model, index).map_err(liberr!("Failed to get score"))?)
     }
 
     fn collect_score(context: &libvmaf::Context, model: &libvmaf::Model, pool_method: PoolingMethod, n_scores: usize) -> Result<Self, Error> {
@@ -117,6 +122,10 @@ impl Score for BootstrappedScore {
     fn use_feature(context: &mut libvmaf::Context, model: &libvmaf::Model) -> Result<(), Error> {
         context.use_collection_model_feature(model).map_err(liberr!("Failed to set model feature to use"))?;
         Ok(())
+    }
+
+    fn score_at_index(context: &libvmaf::Context, model: &libvmaf::Model, index: usize) -> Result<Self, Error> {
+        Ok(context.bootstrapped_score_at_index(model, index).map_err(liberr!("Failed to get bootstrapped score"))?)
     }
 
     fn collect_score(context: &libvmaf::Context, model: &libvmaf::Model, pool_method: PoolingMethod, n_scores: usize) -> Result<Self, Error> {
@@ -197,8 +206,13 @@ impl<S: Score> ScoreCollector<S> {
         self.n_scores.load(Ordering::Acquire)
     }
 
+    pub fn score_at_index(&mut self, index: usize) -> Result<S, Error> {
+        self.context.ensure_flushed().map_err(liberr!("Failed to flush scores"))?;
+        S::score_at_index(&self.context, &self.model.model, index)
+    }
+
     pub fn collect_score(&mut self, opts: ScoreCollectorCollectScoreOpts) -> Result<S, Error> {
-        self.context.wait_for_all_pictures_flushed().map_err(liberr!("Failed to flush scores"))?;
+        self.context.ensure_flushed().map_err(liberr!("Failed to flush scores"))?;
         let score = S::collect_score(&self.context, &self.model.model, opts.pool_method, self.n_scores())?;
 
         self.write_score_if_needed(opts.output_path, opts.output_format)?;

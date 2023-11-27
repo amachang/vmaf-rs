@@ -328,7 +328,7 @@ impl<R: io::Read + io::Seek + Send + Sync + 'static> PictureStream<R> {
 
         if video_info.is_interlaced() {
             rawvideoparse.set_property("interlaced", true);
-            rawvideoparse.set_property("ttf", video_info.field_order() == gst_video::VideoFieldOrder::TopFieldFirst)
+            rawvideoparse.set_property("top-field-first", video_info.field_order() == gst_video::VideoFieldOrder::TopFieldFirst)
         } else {
             rawvideoparse.set_property("interlaced", false)
         }

@@ -15,6 +15,7 @@ pub enum Error {
     FailedConversionCInteger(String),
     ModelNotSupportedBootstrappedScore(ModelVersion),
     PitureAlreadyConsumed,
+    ContextAlreadyFlushed,
 }
 
 impl From<SysError> for Error {
@@ -493,6 +494,7 @@ impl Default for CollectScoreOpts {
 #[derive(Debug)]
 pub struct Context {
     ptr: NonNull<VmafContext>,
+    flushed: bool,
 }
 
 impl Context {
@@ -517,7 +519,7 @@ impl Context {
         }
 
         let ptr = NonNull::new(ptr).unwrap();
-        Ok(Self { ptr })
+        Ok(Self { ptr, flushed: false })
     }
 
     /**
@@ -534,6 +536,9 @@ impl Context {
      * @return 0 on success, or < 0 (a negative errno code) on error.
      */
     pub fn use_simple_model_feature(&mut self, model: &Model) -> Result<(), Error> {
+        if self.flushed {
+            return Err(Error::ContextAlreadyFlushed);
+        }
         let model_ptr = model.ptr;
         let r = unsafe { vmaf_use_features_from_model(self.ptr.as_ptr(), model_ptr.as_ptr()) };
         if r != 0 {
@@ -555,6 +560,9 @@ impl Context {
      * @return 0 on success, or < 0 (a negative errno code) on error.
      */
     pub fn use_collection_model_feature(&mut self, model: &Model) -> Result<(), Error> {
+        if self.flushed {
+            return Err(Error::ContextAlreadyFlushed);
+        }
         let Some(model_collection_ptr) = model.collection_ptr else {
             return Err(Error::ModelNotSupportedBootstrappedScore(model.version.clone()));
         };
@@ -584,6 +592,9 @@ impl Context {
      * @return 0 on success, or < 0 (a negative errno code) on error.
      */
     pub fn use_features(&mut self, feature_name: impl AsRef<str>, dict: &FeatureDictionary) -> Result<(), Error> {
+        if self.flushed {
+            return Err(Error::ContextAlreadyFlushed);
+        }
         let feature_name = to_c_string(feature_name)?;
         let r = unsafe { vmaf_use_feature(self.ptr.as_ptr(), (&feature_name).as_ptr(), dict.ptr) };
         if r != 0 {
@@ -610,6 +621,9 @@ impl Context {
      * @return 0 on success, or < 0 (a negative errno code) on error.
      */
     pub fn import_feature(&mut self, feature_name: impl AsRef<str>, value: f64, index: usize) -> Result<(), Error> {
+        if self.flushed {
+            return Err(Error::ContextAlreadyFlushed);
+        }
         let feature_name = to_c_string(feature_name)?;
         let r = unsafe {
             vmaf_import_feature_score(
@@ -647,6 +661,9 @@ impl Context {
      * @return 0 on success, or < 0 (a negative errno code) on error.
      */
     pub fn read_pictures(&mut self, ref_pic: Picture, dist_pic: Picture, index: usize) -> Result<(), Error> {
+        if self.flushed {
+            return Err(Error::ContextAlreadyFlushed);
+        }
         let mut ref_ptr = ref_pic.consume()?;
         let mut dist_ptr = dist_pic.consume()?;
         let r = unsafe { vmaf_read_pictures(self.ptr.as_ptr(), ref_ptr.as_mut(), dist_ptr.as_mut(), to_c_uint(index)?) };
@@ -660,12 +677,24 @@ impl Context {
         Ok(())
     }
 
-    pub fn wait_for_all_pictures_flushed(&mut self) -> Result<(), Error> {
+    pub fn flush(&mut self) -> Result<(), Error> {
+        if self.flushed {
+            return Err(Error::ContextAlreadyFlushed);
+        }
         let r = unsafe { vmaf_read_pictures(self.ptr.as_ptr(), ptr::null_mut(), ptr::null_mut(), 0) };
         if r != 0 {
             return Err(Error::from_sys(r));
         }
+        self.flushed = true;
         Ok(())
+    }
+
+    pub fn ensure_flushed(&mut self) -> Result<(), Error> {
+        if self.flushed {
+            Ok(())
+        } else {
+            self.flush()
+        }
     }
 
     /**
